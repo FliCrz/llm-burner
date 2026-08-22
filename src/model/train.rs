@@ -7,7 +7,11 @@ use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{Int, Tensor, Transaction};
 use burn::train::{InferenceStep, ItemLazy, TrainOutput, TrainStep};
 
-/// The CPU backend used for syncing items between training and validation.
+/// CPU backend used for syncing items between training and validation.
+///
+/// Deliberately pinned to the pure-Rust Flex backend regardless of the
+/// compiled training device: synced loss/logit data is materialized on the
+/// host so the dashboard never allocates on the GPU per step.
 type SyncBackend = burn::backend::Flex<f32, i32>;
 
 /// A next-token prediction batch: input token ids and shifted target ids.

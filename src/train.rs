@@ -11,7 +11,39 @@
 //! - `BF16`: 16-bit bfloat16 (same dynamic range as F32, 50% memory reduction).
 //! - `F16`: 16-bit floating point (smaller dynamic range).
 //!
-//! Training on the Flex backend itself runs with F32 math.
+//! Training always runs with f32 math, regardless of export precision.
+
+/// The weight-backed inference/export backend.
+///
+/// With the default `gpu` feature this is Burn's fused wgpu backend (Vulkan
+/// on Linux/Windows, Metal on macOS); the device is chosen automatically,
+/// preferring high-power GPUs. Without it (`--no-default-features
+/// --features flex`) training and inference run on the pure-Rust CPU backend.
+#[cfg(feature = "gpu")]
+pub type InferBackend = burn::backend::Wgpu<f32, i32>;
+#[cfg(not(feature = "gpu"))]
+pub type InferBackend = burn::backend::Flex<f32, i32>;
+
+/// The training backend: autodiff over [`InferBackend`].
+pub type TrainBackend = burn::backend::Autodiff<InferBackend>;
+
+/// Backend used by unit tests.
+///
+/// Always the pure-Rust CPU backend so `cargo test` never requires a GPU or
+/// Vulkan driver, even in default (GPU) builds.
+pub type TestBackend = burn::backend::Flex<f32, i32>;
+
+/// Human-readable name of the compiled backend for startup logs.
+pub fn backend_label() -> &'static str {
+    #[cfg(feature = "gpu")]
+    {
+        "wgpu/Vulkan (autodiff + fusion)"
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        "Flex (CPU)"
+    }
+}
 
 use crate::model::{CausalLmBatch, LlmModel, LlmModelConfig};
 use crate::ui::Dashboard;
@@ -22,26 +54,16 @@ use burn::optim::{AdamW, AdamWConfig, GradientsParams};
 use burn::tensor::DType;
 use burn::train::{Learner, LearningComponentsMarker};
 
-/// The CPU training backend: autodiff over the flex (pure Rust) backend.
-pub type TrainBackend = burn::backend::Autodiff<burn::backend::Flex<f32, i32>>;
-/// The inference (weight-backed) CPU backend.
-pub type FlexBackend = burn::backend::Flex<f32, i32>;
-
 /// Precision modes supported for training and model weights.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Precision {
     /// Full 32-bit floating point.
+    #[default]
     F32,
     /// 16-bit bfloat16 (same exponent range as F32).
     Bf16,
     /// 16-bit floating point (smaller exponent range).
     F16,
-}
-
-impl Default for Precision {
-    fn default() -> Self {
-        Self::F32
-    }
 }
 
 impl std::fmt::Display for Precision {
@@ -138,7 +160,7 @@ pub fn train_model(
     windows: &[Vec<u32>],
     pad_id: u32,
     cfg: &TrainConfig,
-) -> LlmModel<FlexBackend> {
+) -> LlmModel<InferBackend> {
     assert!(
         windows.len() >= cfg.batch_size,
         "need at least `batch_size` ({}) windows, got {}",
@@ -194,13 +216,13 @@ pub fn train_model(
     model.valid()
 }
 
-/// Move a loaded flex (non-autodiff) model onto the training backend.
-pub fn to_train_backend(model: LlmModel<FlexBackend>) -> LlmModel<TrainBackend> {
+/// Move a loaded inference (non-autodiff) model onto the training backend.
+pub fn to_train_backend(model: LlmModel<InferBackend>) -> LlmModel<TrainBackend> {
     model.train::<TrainBackend>()
 }
 
-/// Move a trained autodiff model back onto the flex backend.
-pub fn to_flex_backend(model: LlmModel<TrainBackend>) -> LlmModel<FlexBackend> {
+/// Move a trained autodiff model back onto the inference backend.
+pub fn to_infer_backend(model: LlmModel<TrainBackend>) -> LlmModel<InferBackend> {
     model.valid()
 }
 
@@ -230,6 +252,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "gpu"))] // trains on the compiled TrainBackend (GPU under `gpu`)
     fn train_model_reduces_loss_on_toy_sequence() {
         let config = LlmModelConfig::tiny();
         let model = train_model_from_config(&config);
@@ -248,7 +271,7 @@ mod tests {
         };
 
         let device = Default::default();
-        let init_batch = build_batch::<FlexBackend>(&windows[0..2], 0, &device);
+        let init_batch = build_batch::<InferBackend>(&windows[0..2], 0, &device);
         let init_loss: f32 = model
             .valid()
             .forward_classification(init_batch)
@@ -257,7 +280,7 @@ mod tests {
 
         let trained = train_model(model, &windows, 0, &cfg);
 
-        let final_batch = build_batch::<FlexBackend>(&windows[0..2], 0, &device);
+        let final_batch = build_batch::<InferBackend>(&windows[0..2], 0, &device);
         let final_loss: f32 = trained
             .forward_classification(final_batch)
             .loss

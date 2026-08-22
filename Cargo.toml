@@ -5,13 +5,15 @@ edition = "2024"
 description = "Download Hugging Face models, fine-tune a Gemma-style transformer with Burn, and export to safetensors and GGUF."
 
 [features]
-default = ["flex"]
+# GPU (wgpu/Vulkan) is the default training backend. Build with
+# `--no-default-features --features flex` for a CPU-only binary.
+default = ["gpu"]
 flex = ["burn/flex", "burn/simd", "burn/autotune"]
-gpu = ["burn/wgpu", "burn/vulkan", "burn/fusion"]
-gpu-cuda = ["burn/wgpu", "burn/cuda", "burn/fusion"]
+gpu = ["burn/wgpu", "burn/vulkan", "burn/fusion", "burn/autotune", "burn/flex", "burn/simd"]
+gpu-cuda = ["burn/wgpu", "burn/cuda", "burn/fusion", "burn/autotune", "burn/flex"]
 
 [dependencies]
-burn = { version = "0.21.0", default-features = false, features = ["std", "train", "dataset", "tui", "metrics", "store", "sqlite-bundled", "autodiff", "flex"] }
+burn = { version = "0.21.0", default-features = false, features = ["std", "train", "dataset", "tui", "metrics", "store", "sqlite-bundled", "autodiff"] }
 burn-core = { version = "0.21.0", default-features = false, features = ["std"] }
 burn-store = { version = "0.21.0", default-features = false, features = ["std"] }
 rlx-gguf = "0.2.14"

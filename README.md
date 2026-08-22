@@ -9,14 +9,28 @@
 Ensure you have a recent Rust toolchain installed (Edition 2024 / Rust 1.97+).
 
 ```bash
-# Build a fast debug binary
+# Build a fast debug binary (GPU/Vulkan backend by default)
 cargo build
 
 # Build an optimized release binary
 cargo build --release
+
+# CPU-only build (no Vulkan drivers required)
+cargo build --release --no-default-features --features flex
 ```
 
 The compiled binary is placed at `target/debug/llm-burner` or `target/release/llm-burner`.
+
+### Backends
+
+| Feature | Default | Backend |
+| --- | --- | --- |
+| `gpu` | yes | Burn fused wgpu backend: Vulkan on Linux/Windows, Metal on macOS. The device is picked automatically, preferring high-power GPUs; override with `CUBECL_WGPU_DEFAULT_DEVICE` (e.g. `IntegratedGpu(0)`, `Cpu`). |
+| `flex` | no (`--no-default-features --features flex`) | Pure-Rust CPU backend with SIMD; training runs f32 math either way. |
+
+Training always computes in f32; `--precision` controls only the dtype of exported safetensors weights.
+
+> **Tip:** always train with `--release`. Debug builds compile compute shaders far slower and can overflow the stack while cubecl autotunes kernels on first use.
 
 ---
 
@@ -74,3 +88,33 @@ cargo run --release -- train \
   --steps 100 \
   --out ./artifacts
 ```
+
+---
+
+## Refusal Ablation (Abliteration)
+
+Fine-tuned chat models often keep refusing requests they were retrained to answer. `train --ablate-refusal` removes the model's *refusal direction* before fine-tuning begins: it measures the difference between residual-stream activations of harmful and harmless probe prompts at one decoder layer, then projects that direction out of every weight matrix writing into the residual stream (`o_proj`, `down_proj`). Because the change is applied to weights, it is permanent and survives both `.safetensors` and GGUF export.
+
+```bash
+cargo run --release -- train \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --dataset wikitext \
+  --steps 200 \
+  --ablate-refusal \
+  --out ./artifacts
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--ablate-refusal` | off | Enable refusal-direction ablation before training. |
+| `--refusal-layer <N>` | `2 * n_layers / 3` | Decoder layer used to measure the direction. |
+| `--ablate-scale <F>` | `1.0` | Removal strength in `[0, 1]`; lower values soften the effect. |
+| `--harmful-file <PATH>` | built-in list | Newline-separated harmful probes (one per line; `#` comments allowed). |
+| `--harmless-file <PATH>` | built-in list | Newline-separated harmless probe prompts. |
+
+The built-in probe lists are small AdvBench-style corpora (48 + 48 prompts). For best results on a specific model, override them with larger lists such as [FailSpy's `harmful.txt` / `harmless.txt`](https://huggingface.co/datasets/failspy/abliteration) or AdvBench behaviors.
+
+Notes:
+* Probes are encoded as raw text; chat-template wrapping is not applied, which is usually sufficient because the direction generalizes across formats.
+* The logged `cos(harmful, harmless)` similarity is a quality signal — values close to 1 mean the probe sets barely separate and the measured direction may be noisy.
+* Ablation runs once, right after checkpoint load; fine-tuning then proceeds exactly as usual.

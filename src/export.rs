@@ -12,7 +12,7 @@ use rlx_gguf::{GgmlType, GgufWriter, MetaValue, quantize};
 use crate::data::TokenizerStore;
 use crate::model::load::FloatDTypeAdapter;
 use crate::model::{LlmModel, LlmModelConfig};
-use crate::train::{FlexBackend, Precision};
+use crate::train::Precision;
 
 /// Dtype for tensors that must not be quantized: 1-D RMSNorm weights (llama.cpp
 /// multiplies them elementwise, which is unsupported against quantized types)
@@ -115,8 +115,8 @@ fn transpose(flat: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 }
 
 /// Write the model to a GGUF file using the `Q4K` (≈ Q4_K_M) scheme.
-pub fn export_gguf(
-    model: &LlmModel<FlexBackend>,
+pub fn export_gguf<B: burn::tensor::backend::Backend>(
+    model: &LlmModel<B>,
     config: &LlmModelConfig,
     tokenizer: &TokenizerStore,
     path: &Path,
@@ -297,8 +297,8 @@ pub fn add_tokenizer_metadata(
 }
 
 /// Write the model to a PyTorch-compatible `.safetensors` file.
-pub fn export_safetensors(
-    model: &LlmModel<FlexBackend>,
+pub fn export_safetensors<B: burn::tensor::backend::Backend>(
+    model: &LlmModel<B>,
     path: &Path,
     precision: Precision,
 ) -> Result<()> {
@@ -389,10 +389,10 @@ mod tests {
     #[test]
     fn check_lm_head_shape() {
         use crate::model::LlmModelConfig;
-        use crate::train::FlexBackend;
+        use crate::train::TestBackend;
         let device = burn::backend::flex::FlexDevice;
         let config = LlmModelConfig::tiny();
-        let model = crate::model::LlmModel::<FlexBackend>::new(&config, &device);
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
         let snapshots = model.collect(None, None, false);
         for s in &snapshots {
             let path = s.full_path();
@@ -412,12 +412,12 @@ mod tests {
     #[test]
     fn exported_gguf_declares_llama_cpp_dims() {
         use crate::model::LlmModelConfig;
-        use crate::train::FlexBackend;
+        use crate::train::TestBackend;
         use rlx_gguf::GgufFile;
 
         let device = burn::backend::flex::FlexDevice;
         let config = LlmModelConfig::tiny();
-        let model = crate::model::LlmModel::<FlexBackend>::new(&config, &device);
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
         let tokenizer = dummy_tokenizer(&config).unwrap();
 
         let dir = tempfile::tempdir().unwrap();

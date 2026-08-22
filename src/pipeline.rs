@@ -9,8 +9,9 @@ use crate::config::TransformersConfig;
 use crate::data::{TokenizerStore, collect_text_files, read_corpus, sliding_windows};
 use crate::export::{export_gguf, export_safetensors};
 use crate::hf::{HfRepo, classify_download};
+use crate::model::ablation::{AblationConfig, apply_ablation};
 use crate::model::{LlmModel, LlmModelConfig};
-use crate::train::{FlexBackend, TrainBackend, TrainConfig, train_model};
+use crate::train::{InferBackend, TrainBackend, TrainConfig, train_model};
 
 use burn::module::Module;
 
@@ -26,6 +27,8 @@ pub struct PipelineInputs {
     pub out_dir: PathBuf,
     /// Training hyper-parameters.
     pub train: TrainConfig,
+    /// Optional refusal-direction ablation applied before training.
+    pub ablation: Option<AblationConfig>,
     /// Name recorded in GGUF metadata.
     pub model_name: String,
 }
@@ -45,7 +48,7 @@ pub fn default_dataset_dir(out: &Path, repo: &crate::data::HfDataset) -> PathBuf
 /// Load a model checkpoint from `model_dir` into a flex-backed model.
 pub fn load_model_from_dir(
     model_dir: &Path,
-) -> Result<(LlmModel<FlexBackend>, LlmModelConfig, TokenizerStore)> {
+) -> Result<(LlmModel<InferBackend>, LlmModelConfig, TokenizerStore)> {
     let config_path = model_dir.join("config.json");
     if !config_path.exists() {
         bail!(
@@ -72,7 +75,7 @@ pub fn load_model_from_dir(
     }
     let shards_refs: Vec<&Path> = shards.iter().map(PathBuf::as_path).collect();
 
-    let mut model = LlmModel::<FlexBackend>::new(&config, &Default::default());
+    let mut model = LlmModel::<InferBackend>::new(&config, &Default::default());
     crate::model::load::load_from_safetensors(&mut model, &shards_refs)?;
 
     Ok((model, config, tokenizer))
@@ -128,7 +131,7 @@ fn copy_export_inputs(model_dir: &Path, out_dir: &Path) -> Result<()> {
 /// Run the full fine-tune-and-export pipeline.
 pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
     log::info!("loading model from `{}`", inputs.model_dir.display());
-    let (model, config, mut tokenizer) = load_model_from_dir(&inputs.model_dir)?;
+    let (mut model, config, mut tokenizer) = load_model_from_dir(&inputs.model_dir)?;
 
     if config.vocab_size == 0 {
         bail!("model config has zero vocabulary size");
@@ -137,6 +140,11 @@ pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
         bail!("seq-len must be at least 1");
     }
     tokenizer.set_seq_len(inputs.train.seq_len);
+
+    if let Some(cfg) = &inputs.ablation {
+        log::info!("applying refusal-direction ablation");
+        apply_ablation(&mut model, &tokenizer, cfg, config.max_seq_len)?;
+    }
 
     log::info!("tokenizing corpus in `{}`", inputs.dataset_dir.display());
     let files = collect_text_files(&inputs.dataset_dir, &["txt", "text", "md", "jsonl"]);
