@@ -26,9 +26,27 @@ The compiled binary is placed at `target/debug/llm-burner` or `target/release/ll
 | Feature | Default | Backend |
 | --- | --- | --- |
 | `gpu` | yes | Burn fused wgpu backend: Vulkan on Linux/Windows, Metal on macOS. The device is picked automatically, preferring high-power GPUs; override with `CUBECL_WGPU_DEFAULT_DEVICE` (e.g. `IntegratedGpu(0)`, `Cpu`). |
-| `flex` | no (`--no-default-features --features flex`) | Pure-Rust CPU backend with SIMD; training runs f32 math either way. |
+| `flex` | no (`--no-default-features --features flex`) | Pure-Rust CPU backend with SIMD; computes in f32 only. |
 
-Training always computes in f32; `--precision` controls only the dtype of exported safetensors weights.
+`--precision f32|bf16|f16` selects the dtype for checkpoint loading, training math,
+optimizer state, and safetensors export on GPU builds — the whole stack runs in the
+selected precision (F32 remains the default because pure half-precision AdamW can be
+numerically fragile). On `flex` builds only f32 is available.
+
+> **Known issue:** on AMD RADV (Mesa ≤ 25.0.x) `--precision bf16` segfaults inside
+> `libvulkan_radeon.so` while compiling cubecl's bf16 compute pipelines (bf16 is
+> emulated through bit-manipulation SPIR-V that trips this driver). `--precision f16`
+> works — WGSL supports it natively. Revisit bf16 after a Mesa upgrade.
+
+Use `--no-tui` to skip the Ratatui dashboard (tests, CI, non-interactive runs);
+progress goes to the log file only.
+
+While training runs, raw stdout/stderr are redirected into `train.log` so cubecl/wgpu
+compile diagnostics cannot garble the Ratatui dashboard; everything lands in
+`artifacts/trained/train.log`.
+
+Corpus tokenization streams files in ~1 MiB line-aligned chunks into a flat window
+arena, so peak RAM stays around a few hundred MB even for multi-gigabyte corpora.
 
 > **Tip:** always train with `--release`. Debug builds compile compute shaders far slower and can overflow the stack while cubecl autotunes kernels on first use.
 

@@ -1,9 +1,8 @@
 //! Text datasets: downloading Hugging Face text datasets, tokenization, and
 //! building causal-LM batches for training.
 //!
-//! Pure token-level helpers (`sliding_windows`, `pack_batches`) are backend
-//! agnostic and unit-tested; tensor construction happens in
-//! [`build_causal_batch`].
+//! [`WindowStore`] keeps training windows in one flat arena so batches are
+//! contiguous slices; tensor construction happens in [`build_causal_batch_from_flat`].
 
 use std::path::{Path, PathBuf};
 
@@ -271,37 +270,221 @@ pub fn sliding_windows(
     rows
 }
 
-/// Shift every window left by one token to produce targets: the target for the
-/// first `seq_len - 1` positions is the next token; the last is `pad_id`.
-pub fn shifted_targets(windows: &[Vec<u32>], pad_id: u32) -> Vec<Vec<u32>> {
-    windows
-        .iter()
-        .map(|w| {
-            let mut target = w[1..].to_vec();
-            target.push(pad_id);
-            target
-        })
-        .collect()
+/// Flat token arena holding consecutive causal windows.
+///
+/// Windows produced by [`tokenize_corpus`] tile the token stream with stride ==
+/// `seq_len`, so window `i` occupies `tokens[i*seq_len .. (i+1)*seq_len]` and a
+/// batch of consecutive windows is a single contiguous slice. Building training
+/// tensors therefore never materializes per-window `Vec`s.
+#[derive(Debug, Clone)]
+pub struct WindowStore {
+    tokens: Vec<u32>,
+    seq_len: usize,
 }
 
-/// Build a causal-LM batch pair from token windows on a backend.
-pub fn build_causal_batch<B: burn::tensor::backend::Backend>(
-    windows: &[Vec<u32>],
+impl WindowStore {
+    /// Create an empty arena with the given window length.
+    pub fn new(seq_len: usize) -> Self {
+        assert!(seq_len > 0, "seq_len must be positive");
+        Self {
+            tokens: Vec::new(),
+            seq_len,
+        }
+    }
+
+    /// Number of complete windows held.
+    pub fn len(&self) -> usize {
+        self.tokens.len() / self.seq_len
+    }
+
+    /// True when no complete window is held.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Tokens per window.
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    /// Total number of tokens stored (a multiple of `seq_len`).
+    pub fn total_tokens(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Append whole windows from a contiguous buffer whose length is a
+    /// multiple of `seq_len`.
+    pub fn extend_windows(&mut self, flat: &[u32]) {
+        debug_assert_eq!(
+            flat.len() % self.seq_len,
+            0,
+            "expected whole windows, got {} tokens for seq_len {}",
+            flat.len(),
+            self.seq_len
+        );
+        self.tokens.extend_from_slice(flat);
+    }
+
+    /// Append one final window from a partial tail, right-padded with `pad_id`.
+    pub fn push_padded_tail(&mut self, tokens: &[u32], pad_id: u32) {
+        if tokens.is_empty() {
+            return;
+        }
+        self.tokens.extend_from_slice(tokens);
+        let rem = self.tokens.len() % self.seq_len;
+        if rem > 0 {
+            self.tokens.resize(self.tokens.len() + (self.seq_len - rem), pad_id);
+        }
+    }
+
+    /// Full batches available for the given `batch_size`; a trailing partial
+    /// batch is dropped so step counts stay exact.
+    pub fn batch_count(&self, batch_size: usize) -> usize {
+        if batch_size == 0 {
+            return 0;
+        }
+        self.len() / batch_size
+    }
+
+    /// Contiguous token buffer covering `n_windows` consecutive windows
+    /// starting at window index `start_window`.
+    pub fn window_tokens(&self, start_window: usize, n_windows: usize) -> &[u32] {
+        let from = start_window * self.seq_len;
+        &self.tokens[from..from + n_windows * self.seq_len]
+    }
+}
+
+/// Target size of the text slices handed to the tokenizer.
+///
+/// The HF tokenizers library materializes a full `Encoding` (per-token piece
+/// strings, offsets, masks) for whatever it is asked to encode — measured at
+/// roughly 100x the input size in RAM. Feeding it the corpus in ~1 MiB
+/// line-aligned chunks keeps that overhead bounded regardless of file size.
+const CHUNK_TARGET_BYTES: usize = 1024 * 1024;
+
+/// Tokenize text files into a flat window arena with bounded memory use.
+///
+/// Files are read in [`CHUNK_TARGET_BYTES`] line-aligned chunks and encoded one
+/// chunk at a time; a carry-over tail of fewer than `seq_len` tokens stitches
+/// the token stream across chunk and file boundaries. Peak memory is therefore
+/// O(chunk + window arena) instead of O(corpus), and windows are never
+/// allocated individually.
+///
+/// Returns the arena and the total number of encoded tokens (before padding).
+/// A newline separator is inserted between files (mirroring whole-corpus
+/// concatenation). Subword merges cannot span chunk or file borders; with 1 MiB
+/// chunks that only affects a handful of boundary tokens per megabyte.
+pub fn tokenize_corpus(
+    tokenizer: &TokenizerStore,
+    files: &[PathBuf],
+    seq_len: usize,
+    pad_id: u32,
+) -> Result<(WindowStore, usize)> {
+    tokenize_corpus_sized(tokenizer, files, seq_len, pad_id, CHUNK_TARGET_BYTES)
+}
+
+/// [`tokenize_corpus`] with an explicit chunk target; exposed for tests.
+fn tokenize_corpus_sized(
+    tokenizer: &TokenizerStore,
+    files: &[PathBuf],
+    seq_len: usize,
+    pad_id: u32,
+    chunk_target_bytes: usize,
+) -> Result<(WindowStore, usize)> {
+    if seq_len == 0 {
+        anyhow::bail!("seq-len must be at least 1");
+    }
+    // One truncation/padding-free clone for the whole run; encoding many
+    // chunks through `encode_raw` would re-clone per call.
+    let mut raw = tokenizer.tokenizer.clone();
+    raw.with_truncation(None)
+        .map_err(|e| anyhow::anyhow!("failed to clear truncation: {e}"))?;
+    raw.with_padding(None);
+
+    let mut store = WindowStore::new(seq_len);
+    let mut carry: Vec<u32> = Vec::new();
+    let mut total = 0usize;
+
+    for file in files {
+        let f = std::fs::File::open(file)
+            .with_context(|| format!("failed to read `{}`", file.display()))?;
+        let reader = std::io::BufReader::with_capacity(chunk_target_bytes.max(8192), f);
+        let mut chunk = String::new();
+        for line in std::io::BufRead::lines(reader) {
+            let line = line.with_context(|| format!("failed to read `{}`", file.display()))?;
+            chunk.push_str(&line);
+            chunk.push('\n');
+            if chunk.len() >= chunk_target_bytes {
+                total += push_encoded(&raw, &chunk, &mut carry, &mut store)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            total += push_encoded(&raw, &chunk, &mut carry, &mut store)?;
+        }
+        // Separator mirrors the previous whole-corpus reader, which joined
+        // files with '\n'.
+        if !carry.is_empty() || !store.is_empty() {
+            total += push_encoded(&raw, "\n", &mut carry, &mut store)?;
+        }
+    }
+    store.push_padded_tail(&carry, pad_id);
+
+    Ok((store, total))
+}
+
+/// Encode `text`, append its ids to the carry buffer, and drain every
+/// complete window into the arena. Returns the number of encoded tokens.
+fn push_encoded(
+    raw: &Tokenizer,
+    text: &str,
+    carry: &mut Vec<u32>,
+    store: &mut WindowStore,
+) -> Result<usize> {
+    let encoding = raw
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("tokenizer failed: {e}"))?;
+    let count = encoding.get_ids().len();
+    carry.extend_from_slice(encoding.get_ids());
+    let seq_len = store.seq_len();
+    let complete = carry.len() - carry.len() % seq_len;
+    if complete > 0 {
+        store.extend_windows(&carry[..complete]);
+        carry.drain(..complete);
+    }
+    Ok(count)
+}
+
+/// Build a causal-LM batch pair from a contiguous buffer of consecutive
+/// windows on a backend.
+///
+/// `flat` must hold whole rows of `seq_len` tokens. Targets are each row
+/// shifted left by one token; the last target position of every row is
+/// `pad_id`.
+pub fn build_causal_batch_from_flat<B: burn::tensor::backend::Backend>(
+    flat: &[u32],
+    seq_len: usize,
     device: &B::Device,
     pad_id: u32,
 ) -> CausalLmBatch<B> {
     use burn::tensor::{Tensor, TensorData};
 
-    let seq_len = windows[0].len();
-    let batch_size = windows.len();
-    let flat: Vec<u32> = windows.iter().flatten().copied().collect();
-    let targets: Vec<u32> = shifted_targets(windows, pad_id)
-        .into_iter()
-        .flatten()
-        .collect();
+    assert!(seq_len > 0, "seq_len must be positive");
+    assert!(
+        !flat.is_empty() && flat.len().is_multiple_of(seq_len),
+        "batch buffer must hold whole rows, got {} tokens for seq_len {}",
+        flat.len(),
+        seq_len
+    );
+    let rows = flat.len() / seq_len;
+    let mut targets = Vec::with_capacity(flat.len());
+    for chunk in flat.chunks(seq_len) {
+        targets.extend_from_slice(&chunk[1..]);
+        targets.push(pad_id);
+    }
 
-    let input = Tensor::from_data(TensorData::new(flat, [batch_size, seq_len]), device);
-    let target = Tensor::from_data(TensorData::new(targets, [batch_size, seq_len]), device);
+    let input = Tensor::from_data(TensorData::new(flat.to_vec(), [rows, seq_len]), device);
+    let target = Tensor::from_data(TensorData::new(targets, [rows, seq_len]), device);
     CausalLmBatch::new(input, target)
 }
 
@@ -329,21 +512,41 @@ pub fn collect_text_files(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     out
 }
 
-/// Read a list of text files, concatenating their contents with newlines.
-pub fn read_corpus(paths: &[PathBuf]) -> Result<String> {
-    let mut corpus = String::new();
-    for path in paths {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read `{}`", path.display()))?;
-        corpus.push_str(&text);
-        corpus.push('\n');
-    }
-    Ok(corpus)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestBackend = burn::backend::Flex<f32, i32>;
+
+    /// A tiny whitespace/word-level tokenizer: `one`=10 `two`=11 `three`=12
+    /// `four`=13; anything else maps to `[UNK]`=0. Newlines vanish under the
+    /// whitespace pre-tokenizer.
+    fn word_pseudo_tokenizer() -> TokenizerStore {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tok.json");
+        let vocab: ahash::AHashMap<String, u32> = [
+            ("one", 10),
+            ("two", 11),
+            ("three", 12),
+            ("four", 13),
+            ("[UNK]", 0),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+        let mut tokenizer = Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("[UNK]".to_string())
+                .build()
+                .unwrap(),
+        );
+        tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+        std::fs::write(&path, serde_json::to_string(&tokenizer).unwrap()).unwrap();
+        let store = TokenizerStore::from_file(&path).unwrap();
+        drop(dir); // tokenizer already parsed into memory
+        store
+    }
 
     #[test]
     fn parses_dataset_id() {
@@ -361,27 +564,69 @@ mod tests {
     }
 
     #[test]
-    fn sliding_windows_honor_stride() {
-        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let rows = sliding_windows(&tokens, 4, 2, 9);
-        assert_eq!(
-            rows,
-            vec![
-                vec![1, 2, 3, 4],
-                vec![3, 4, 5, 6],
-                vec![5, 6, 7, 8],
-                vec![7, 8, 9, 9]
-            ]
-        );
+    fn window_store_batches_are_contiguous_slices() {
+        let mut store = WindowStore::new(4);
+        store.extend_windows(&[1, 2, 3, 4]);
+        store.extend_windows(&[5, 6, 7, 8]);
+        store.push_padded_tail(&[9], 0);
+
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.total_tokens(), 12);
+        assert_eq!(store.window_tokens(0, 2), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(store.window_tokens(2, 1), &[9, 0, 0, 0]);
+        assert_eq!(store.batch_count(2), 1);
+        assert_eq!(store.batch_count(4), 0);
     }
 
     #[test]
-    fn shifted_targets_use_pad_for_last_position() {
-        let windows = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
-        assert_eq!(
-            shifted_targets(&windows, 0),
-            vec![vec![2, 3, 4, 0], vec![6, 7, 8, 0]]
-        );
+    fn flat_batch_shifts_targets_by_one() {
+        let device = Default::default();
+        let batch =
+            build_causal_batch_from_flat::<TestBackend>(&[1, 2, 3, 4, 5, 6, 7, 8], 4, &device, 0);
+        let input: Vec<i32> = batch.input.into_data().to_vec::<i32>().unwrap();
+        let target: Vec<i32> = batch.target.into_data().to_vec::<i32>().unwrap();
+        assert_eq!(input, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(target, vec![2, 3, 4, 0, 6, 7, 8, 0]);
+    }
+
+    #[test]
+    fn tokenize_corpus_stitches_files_and_pads_tail() {
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let a = corpus_dir.path().join("a.txt");
+        let b = corpus_dir.path().join("b.txt");
+        std::fs::write(&a, "one two").unwrap();
+        std::fs::write(&b, "three four").unwrap();
+
+        let tokenizer = word_pseudo_tokenizer();
+        let (store, total) = tokenize_corpus(&tokenizer, &[a, b], 3, 0).unwrap();
+
+        // Stream: [one two] [three four] -> ids [10,11,12,13]; '\n' yields no
+        // tokens under the whitespace pre-tokenizer.
+        assert_eq!(total, 4);
+        assert_eq!(store.seq_len(), 3);
+        // One complete window + one padded tail window.
+        assert_eq!(store.len(), 2);
+        // The first window spans the file boundary thanks to the carry-over.
+        assert_eq!(store.window_tokens(0, 1), &[10, 11, 12]);
+        assert_eq!(store.window_tokens(1, 1), &[13, 0, 0]);
+    }
+
+    #[test]
+    fn tokenize_corpus_chunks_stitch_within_a_file() {
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let a = corpus_dir.path().join("a.txt");
+        std::fs::write(&a, "one two\nthree four\n").unwrap();
+
+        let tokenizer = word_pseudo_tokenizer();
+        // 4-byte chunk target forces an encode call per line.
+        let (store, total) =
+            tokenize_corpus_sized(&tokenizer, &[a], 3, 0, 4).unwrap();
+
+        // Same stream as the whole-file encoding of "one two\nthree four".
+        assert_eq!(total, 4);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.window_tokens(0, 1), &[10, 11, 12]);
+        assert_eq!(store.window_tokens(1, 1), &[13, 0, 0]);
     }
 
     #[test]

@@ -160,9 +160,18 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
         let data = snapshot
             .to_data()
             .map_err(|e| anyhow::anyhow!("failed to read `{}`: {e}", snapshot.full_path()))?;
-        let floats: Vec<f32> = data.to_vec::<f32>().map_err(|e| {
-            anyhow::anyhow!("failed to read `{}` as f32: {e}", snapshot.full_path())
-        })?;
+        // The trained model may hold half-precision weights; GGUF writing and
+        // Q4_K quantization both operate on f32, so convert any float dtype.
+        let floats: Vec<f32> = if data.dtype == burn::tensor::DType::F32 {
+            data.to_vec::<f32>().map_err(|e| {
+                anyhow::anyhow!("failed to read `{}` as f32: {e}", snapshot.full_path())
+            })?
+        } else {
+            let converted = data.convert_dtype(burn::tensor::DType::F32);
+            converted.to_vec::<f32>().map_err(|e| {
+                anyhow::anyhow!("failed to read `{}` as f32: {e}", snapshot.full_path())
+            })?
+        };
 
         // GGUF declares dimensions fastest-first: ne[0] is the contiguous
         // axis, i.e. ne is the reverse of the row-major shape of the stored

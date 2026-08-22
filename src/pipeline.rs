@@ -1,19 +1,28 @@
 //! End-to-end pipeline glue: load a checkpoint, prepare the corpus, run the
 //! exact-step fine-tune, and export safetensors + GGUF.
+//!
+//! [`run_pipeline`] maps the requested [`Precision`] onto compile-time backend
+//! instantiations and delegates to [`run_pipeline_typed`], which is generic
+//! over the backend. Everything downstream — checkpoint casting, forward/
+//! backward math, optimizer state, export — then runs in the selected dtype.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+#[cfg(feature = "gpu")]
+use half::{bf16, f16};
 
 use crate::config::TransformersConfig;
-use crate::data::{TokenizerStore, collect_text_files, read_corpus, sliding_windows};
+use crate::data::{TokenizerStore, collect_text_files, tokenize_corpus};
 use crate::export::{export_gguf, export_safetensors};
 use crate::hf::{HfRepo, classify_download};
 use crate::model::ablation::{AblationConfig, apply_ablation};
 use crate::model::{LlmModel, LlmModelConfig};
-use crate::train::{InferBackend, TrainBackend, TrainConfig, train_model};
+use crate::train::{Precision, TrainConfig, backend_label, train_model};
 
+use burn::backend::Autodiff;
 use burn::module::Module;
+use burn::tensor::backend::Backend;
 
 /// Inputs for a training run.
 #[derive(Debug, Clone)]
@@ -45,10 +54,15 @@ pub fn default_dataset_dir(out: &Path, repo: &crate::data::HfDataset) -> PathBuf
         .join(format!("{}--{}", repo.owner, repo.name))
 }
 
-/// Load a model checkpoint from `model_dir` into a flex-backed model.
-pub fn load_model_from_dir(
+/// Load a model checkpoint from `model_dir`, casting all float tensors to the
+/// dtype implied by `precision`.
+pub fn load_model_from_dir<B>(
     model_dir: &Path,
-) -> Result<(LlmModel<InferBackend>, LlmModelConfig, TokenizerStore)> {
+    precision: Precision,
+) -> Result<(LlmModel<B>, LlmModelConfig, TokenizerStore)>
+where
+    B: Backend,
+{
     let config_path = model_dir.join("config.json");
     if !config_path.exists() {
         bail!(
@@ -75,8 +89,12 @@ pub fn load_model_from_dir(
     }
     let shards_refs: Vec<&Path> = shards.iter().map(PathBuf::as_path).collect();
 
-    let mut model = LlmModel::<InferBackend>::new(&config, &Default::default());
-    crate::model::load::load_from_safetensors(&mut model, &shards_refs)?;
+    let mut model = LlmModel::<B>::new(&config, &Default::default());
+    crate::model::load::load_from_safetensors(
+        &mut model,
+        &shards_refs,
+        precision.safetensors_dtype(),
+    )?;
 
     Ok((model, config, tokenizer))
 }
@@ -128,10 +146,49 @@ fn copy_export_inputs(model_dir: &Path, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run the full fine-tune-and-export pipeline.
+/// Run the full fine-tune-and-export pipeline with the backend selected by
+/// the requested precision.
+///
+/// On GPU builds the requested dtype drives the whole stack (wgpu compiles
+/// bf16/f16 kernels). The pure-Rust CPU fallback backend computes in f32 only,
+/// so half precisions require a default-feature (`gpu`) build.
+#[cfg(feature = "gpu")]
 pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
-    log::info!("loading model from `{}`", inputs.model_dir.display());
-    let (mut model, config, mut tokenizer) = load_model_from_dir(&inputs.model_dir)?;
+    match inputs.train.precision {
+        Precision::F32 => run_pipeline_typed::<burn::backend::Wgpu<f32, i32>>(inputs),
+        Precision::Bf16 => run_pipeline_typed::<burn::backend::Wgpu<bf16, i32>>(inputs),
+        Precision::F16 => run_pipeline_typed::<burn::backend::Wgpu<f16, i32>>(inputs),
+    }
+}
+
+/// CPU-only variant: half-precision compute is not available on the Flex
+/// backend, which is instantiated for f32.
+#[cfg(not(feature = "gpu"))]
+pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
+    if inputs.train.precision != Precision::F32 {
+        bail!(
+            "--precision {} requires a GPU build; this binary was compiled for \
+             the CPU Flex backend, which supports f32 compute only",
+            inputs.train.precision
+        );
+    }
+    run_pipeline_typed::<burn::backend::Flex<f32, i32>>(inputs)
+}
+
+/// Typed pipeline body: every stage runs on backend `B`.
+fn run_pipeline_typed<B>(inputs: &PipelineInputs) -> Result<()>
+where
+    B: Backend,
+    Autodiff<B>: burn::tensor::backend::AutodiffBackend<InnerBackend = B>,
+    f32: From<<Autodiff<B> as burn::tensor::backend::BackendTypes>::FloatElem>,
+{
+    log::info!(
+        "loading model from `{}` as {}",
+        inputs.model_dir.display(),
+        inputs.train.precision
+    );
+    let (mut model, config, mut tokenizer) =
+        load_model_from_dir::<B>(&inputs.model_dir, inputs.train.precision)?;
 
     if config.vocab_size == 0 {
         bail!("model config has zero vocabulary size");
@@ -154,36 +211,34 @@ pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
             inputs.dataset_dir.display()
         );
     }
-    let corpus = read_corpus(&files)?;
-    let ids = tokenizer.encode_raw(&corpus)?;
-    let windows = sliding_windows(
-        &ids,
-        inputs.train.seq_len,
-        inputs.train.seq_len,
-        tokenizer.pad_id,
-    );
+    // Streaming: one file resident at a time; windows land in one flat arena.
+    let (windows, total_tokens) =
+        tokenize_corpus(&tokenizer, &files, inputs.train.seq_len, tokenizer.pad_id)?;
     if windows.len() < inputs.train.batch_size {
         bail!(
-            "corpus produced {} windows, but `batch-size` is {}; shorten `--seq-len` or add more text",
+            "corpus produced {} windows ({} tokens), but `batch-size` is {}; shorten `--seq-len` or add more text",
             windows.len(),
+            total_tokens,
             inputs.train.batch_size
         );
     }
     log::info!(
         "corpus: {} tokens -> {} windows (seq_len {})",
-        ids.len(),
+        total_tokens,
         windows.len(),
         inputs.train.seq_len
     );
 
     log::info!(
-        "training for {} steps (batch {}, lr {}, wd {})",
+        "training for {} steps (batch {}, lr {}, wd {}, precision {}) on {}",
         inputs.train.steps,
         inputs.train.batch_size,
         inputs.train.lr,
-        inputs.train.weight_decay
+        inputs.train.weight_decay,
+        inputs.train.precision,
+        backend_label()
     );
-    let ad_model: LlmModel<TrainBackend> = model.train();
+    let ad_model: LlmModel<Autodiff<B>> = model.train();
     let trained = train_model(ad_model, &windows, tokenizer.pad_id, &inputs.train);
 
     std::fs::create_dir_all(&inputs.out_dir)

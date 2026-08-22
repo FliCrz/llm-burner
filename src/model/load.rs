@@ -60,9 +60,14 @@ impl ModuleAdapter for FloatDTypeAdapter {
 /// Load weights from one or more Hugging Face `.safetensors` shard files
 /// (PyTorch layout) into the model.
 ///
-/// Floating-point tensors are cast to F32 while loading so Flex<f32> models can
-/// reliably ingest F16/BF16 source checkpoints.
-pub fn load_from_safetensors<B: Backend>(model: &mut LlmModel<B>, paths: &[&Path]) -> Result<()> {
+/// Floating-point tensors are cast to `target_dtype` while loading so models
+/// compiled for F32, BF16 or F16 can reliably ingest checkpoints stored in a
+/// different precision.
+pub fn load_from_safetensors<B: Backend>(
+    model: &mut LlmModel<B>,
+    paths: &[&Path],
+    target_dtype: DType,
+) -> Result<()> {
     let expected: HashSet<String> = model
         .collect(None, None, false)
         .iter()
@@ -72,7 +77,9 @@ pub fn load_from_safetensors<B: Backend>(model: &mut LlmModel<B>, paths: &[&Path
     let mut applied = HashSet::new();
     for path in paths {
         let mut store = SafetensorsStore::from_file(path)
-            .with_from_adapter(FloatDTypeAdapter::new(DType::F32).chain(PyTorchToBurnAdapter))
+            .with_from_adapter(
+                FloatDTypeAdapter::new(target_dtype).chain(PyTorchToBurnAdapter),
+            )
             .allow_partial(true)
             .validate(true);
         let result = store
@@ -141,7 +148,7 @@ mod tests {
 
         // Load with F32 precision
         let mut dest = LlmModel::<B>::new(&config, &device);
-        load_from_safetensors(&mut dest, &[&path]).unwrap();
+        load_from_safetensors(&mut dest, &[&path], DType::F32).unwrap();
 
         // Every tensor must be bit-identical after the round trip.
         let source_views = source.collect(None, None, false);
@@ -171,7 +178,7 @@ mod tests {
         save_with_float_dtype(&source, &bf16_path, DType::BF16);
 
         let mut dest = LlmModel::<B>::new(&config, &device);
-        load_from_safetensors(&mut dest, &[&bf16_path]).unwrap();
+        load_from_safetensors(&mut dest, &[&bf16_path], DType::F32).unwrap();
 
         let source_views = source.collect(None, None, false);
         let dest_views = dest.collect(None, None, false);
@@ -195,7 +202,7 @@ mod tests {
         save_with_float_dtype(&source, &f16_path, DType::F16);
 
         let mut dest = LlmModel::<B>::new(&config, &device);
-        load_from_safetensors(&mut dest, &[&f16_path]).unwrap();
+        load_from_safetensors(&mut dest, &[&f16_path], DType::F32).unwrap();
 
         let source_views = source.collect(None, None, false);
         let dest_views = dest.collect(None, None, false);
@@ -223,7 +230,7 @@ mod tests {
             ..config.clone()
         };
         let mut dest = LlmModel::<B>::new(&bigger, &device);
-        let err = load_from_safetensors(&mut dest, &[&path]).unwrap_err();
+        let err = load_from_safetensors(&mut dest, &[&path], DType::F32).unwrap_err();
         assert!(err.to_string().contains("missing"), "{}", err);
     }
 }

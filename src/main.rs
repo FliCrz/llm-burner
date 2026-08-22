@@ -82,8 +82,13 @@ enum Command {
         #[arg(long, default_value_t = 0.1)]
         weight_decay: f64,
 
-        /// Safetensors weight precision for export: f32, bf16, or f16.
-        /// Training still runs with f32 math.
+        /// Disable the Ratatui progress dashboard (useful for testing and
+        /// non-interactive runs); progress goes to the log file instead.
+        #[arg(long)]
+        no_tui: bool,
+
+        /// Weight/compute precision: f32, bf16, or f16. Applies to checkpoint
+        /// loading, training math, optimizer state, and safetensors export.
         #[arg(long, default_value_t = Precision::F32)]
         precision: Precision,
 
@@ -133,8 +138,6 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let cli = Cli::parse();
     match cli.command {
         Command::Download {
@@ -143,6 +146,7 @@ fn main() -> anyhow::Result<()> {
             out,
             max_workers,
         } => {
+            init_stderr_logger();
             let repo = HfRepo::parse(&model)?;
             let ds = HfDataset::parse(&dataset)?;
 
@@ -188,6 +192,7 @@ fn main() -> anyhow::Result<()> {
             lr,
             weight_decay,
             max_workers,
+            no_tui,
             precision,
             ablate_refusal,
             refusal_layer,
@@ -195,6 +200,17 @@ fn main() -> anyhow::Result<()> {
             harmful_file,
             harmless_file,
         } => {
+            std::fs::create_dir_all(&out)
+                .with_context(|| format!("failed to create `{}`", out.display()))?;
+            let trained_dir = out.join("trained");
+            let log_path = out.join("train.log");
+            let log_file = std::fs::File::create(&log_path)
+                .with_context(|| format!("failed to create `{}`", log_path.display()))?;
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .target(env_logger::Target::Pipe(Box::new(log_file)))
+                .init();
+            println!("logging to `{}`", log_path.display());
+
             let (mdir, ddir) =
                 resolve_inputs(&out, model, model_dir, dataset, dataset_dir, max_workers)?;
 
@@ -214,7 +230,7 @@ fn main() -> anyhow::Result<()> {
             let inputs = PipelineInputs {
                 model_dir: mdir,
                 dataset_dir: ddir,
-                out_dir: out.join("trained"),
+                out_dir: trained_dir,
                 train: TrainConfig {
                     steps,
                     batch_size,
@@ -223,6 +239,8 @@ fn main() -> anyhow::Result<()> {
                     weight_decay,
                     log_every: (steps / 20).max(1),
                     precision,
+                    tui: !no_tui,
+                    output_redirect: Some(log_path.clone()),
                 },
                 ablation: ablate_refusal.then_some(llm_burner::model::ablation::AblationConfig {
                     direction_layer: refusal_layer,
@@ -233,12 +251,14 @@ fn main() -> anyhow::Result<()> {
                 model_name: "llm-burner-finetune".to_string(),
             };
             run_pipeline(&inputs)?;
+            println!("outputs in `{}`", inputs.out_dir.display());
         }
         Command::Export {
             model_dir,
             output,
             model_name,
         } => {
+            init_stderr_logger();
             // Load config from the model directory
             let config_path = model_dir.join("config.json");
             if !config_path.exists() {
@@ -270,7 +290,11 @@ fn main() -> anyhow::Result<()> {
                 &config,
                 &Default::default(),
             );
-            llm_burner::model::load::load_from_safetensors(&mut model, &shards_refs)?;
+            llm_burner::model::load::load_from_safetensors(
+                &mut model,
+                &shards_refs,
+                burn::tensor::DType::F32,
+            )?;
 
             // Export to GGUF
             let gguf_parent = output.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -337,4 +361,9 @@ fn resolve_inputs(
     };
 
     Ok((resolved_model, resolved_dataset))
+}
+
+/// Log to the terminal for commands that do not own it with a TUI.
+fn init_stderr_logger() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 }
