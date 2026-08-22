@@ -31,7 +31,7 @@ enum Command {
         dataset: String,
 
         /// Base output directory (`models/` and `datasets/` are created under it).
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = "artifacts")]
         out: PathBuf,
 
         /// Concurrent file downloads.
@@ -57,8 +57,9 @@ enum Command {
         #[arg(long)]
         dataset_dir: Option<PathBuf>,
 
-        /// Base output directory.
-        #[arg(long, default_value = ".")]
+        /// Base output directory (`models/` and `datasets/` are created under it;
+        /// fine-tuned weights land in `trained/`).
+        #[arg(long, default_value = "artifacts")]
         out: PathBuf,
 
         /// Exact number of optimization steps.
@@ -122,7 +123,7 @@ enum Command {
         model_dir: PathBuf,
 
         /// Output path for the .gguf file.
-        #[arg(long, default_value = "model.gguf")]
+        #[arg(long, default_value = "artifacts/trained/model.gguf")]
         output: PathBuf,
 
         /// Model name string recorded in GGUF metadata.
@@ -197,7 +198,7 @@ fn main() -> anyhow::Result<()> {
             let (mdir, ddir) =
                 resolve_inputs(&out, model, model_dir, dataset, dataset_dir, max_workers)?;
 
-            for path in [&mdir, &ddir, &out] {
+            for path in [&mdir, &ddir] {
                 if !path.exists() {
                     anyhow::bail!("path does not exist: `{}`", path.display());
                 }
@@ -213,7 +214,7 @@ fn main() -> anyhow::Result<()> {
             let inputs = PipelineInputs {
                 model_dir: mdir,
                 dataset_dir: ddir,
-                out_dir: out,
+                out_dir: out.join("trained"),
                 train: TrainConfig {
                     steps,
                     batch_size,

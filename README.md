@@ -55,28 +55,41 @@ Because `llm-burner` implements a lightweight, architecture-compatible transform
 
 ## Usage & Commands
 
+All commands default to a single output root, `./artifacts/` (override with `--out`):
+
+```
+artifacts/
+├── models/<owner>--<name>/     # downloaded model snapshots
+├── datasets/<owner>--<name>/   # downloaded text corpora
+└── trained/                    # fine-tuned outputs
+    ├── model.safetensors       # retrainable checkpoint (--precision)
+    ├── model.gguf              # quantized Q4_K_M export
+    ├── config.json
+    └── tokenizer.json (+ tokenizer_config.json)
+```
+
+The `trained/` directory is self-contained: pass it to `export --model-dir` (or share it) without extra files.
+
 ### 1. Download Model and Dataset
-Downloads `config.json`, tokenizer files, and `.safetensors` weights into `./models/` and text corpus files into `./datasets/`.
+Downloads `config.json`, tokenizer files, and `.safetensors` weights into `./artifacts/models/` and text corpus files into `./artifacts/datasets/`.
 
 ```bash
 cargo run --release -- download \
   --model Qwen/Qwen2.5-0.5B \
-  --dataset wikitext \
-  --out .
+  --dataset wikitext
 ```
 
 ### 2. Fine-Tune and Export
-Fine-tunes the model on the downloaded corpus for an exact `--steps` count with a live Ratatui dashboard, then exports `model.safetensors` and `model.gguf` (`Q4K`) into the output directory.
+Fine-tunes the model on the downloaded corpus for an exact `--steps` count with a live Ratatui dashboard, then exports `model.safetensors` and `model.gguf` (`Q4K`) into `./artifacts/trained/`.
 
 ```bash
 cargo run --release -- train \
-  --model-dir ./models/Qwen--Qwen2.5-0.5B \
-  --dataset-dir ./datasets/wikitext--wikitext-2-raw-v1 \
+  --model-dir ./artifacts/models/Qwen--Qwen2.5-0.5B \
+  --dataset-dir ./artifacts/datasets/wikitext--wikitext-2-raw-v1 \
   --steps 200 \
   --batch-size 4 \
   --seq-len 128 \
-  --lr 3e-4 \
-  --out ./artifacts
+  --lr 3e-4
 ```
 
 Alternatively, `train` can auto-download the repositories on the fly if provided via `--model` and `--dataset` instead of local directories:
@@ -85,8 +98,7 @@ Alternatively, `train` can auto-download the repositories on the fly if provided
 cargo run --release -- train \
   --model Qwen/Qwen2.5-0.5B \
   --dataset wikitext \
-  --steps 100 \
-  --out ./artifacts
+  --steps 100
 ```
 
 ---
@@ -100,8 +112,7 @@ cargo run --release -- train \
   --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
   --dataset wikitext \
   --steps 200 \
-  --ablate-refusal \
-  --out ./artifacts
+  --ablate-refusal
 ```
 
 | Flag | Default | Description |
