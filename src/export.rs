@@ -4,12 +4,15 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use burn_store::{BurnToPyTorchAdapter, ModuleSnapshot, ModuleStore, SafetensorsStore};
+use burn_store::{
+    BurnToPyTorchAdapter, ModuleAdapter, ModuleSnapshot, ModuleStore, SafetensorsStore,
+};
 use rlx_gguf::{GgmlType, GgufWriter, MetaValue, quantize};
 
 use crate::data::TokenizerStore;
+use crate::model::load::FloatDTypeAdapter;
 use crate::model::{LlmModel, LlmModelConfig};
-use crate::train::FlexBackend;
+use crate::train::{FlexBackend, Precision};
 
 /// Dtype for tensors that must not be quantized: 1-D RMSNorm weights (llama.cpp
 /// multiplies them elementwise, which is unsupported against quantized types)
@@ -294,9 +297,15 @@ pub fn add_tokenizer_metadata(
 }
 
 /// Write the model to a PyTorch-compatible `.safetensors` file.
-pub fn export_safetensors(model: &LlmModel<FlexBackend>, path: &Path) -> Result<()> {
+pub fn export_safetensors(
+    model: &LlmModel<FlexBackend>,
+    path: &Path,
+    precision: Precision,
+) -> Result<()> {
     let mut store = SafetensorsStore::from_file(path)
-        .with_to_adapter(BurnToPyTorchAdapter)
+        .with_to_adapter(
+            FloatDTypeAdapter::new(precision.safetensors_dtype()).chain(BurnToPyTorchAdapter),
+        )
         .overwrite(true);
     store
         .collect_from(model)

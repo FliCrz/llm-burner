@@ -182,7 +182,7 @@ pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
         .with_context(|| format!("failed to create `{}`", inputs.out_dir.display()))?;
     copy_export_inputs(&inputs.model_dir, &inputs.out_dir)?;
     let safetensors_path = inputs.out_dir.join("model.safetensors");
-    export_safetensors(&trained, &safetensors_path)?;
+    export_safetensors(&trained, &safetensors_path, inputs.train.precision)?;
 
     let gguf_path = inputs.out_dir.join("model.gguf");
     export_gguf(

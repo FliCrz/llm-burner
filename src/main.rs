@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use llm_burner::data::HfDataset;
 use llm_burner::hf::HfRepo;
 use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir, run_pipeline};
-use llm_burner::train::{TrainConfig, Precision};
+use llm_burner::train::{Precision, TrainConfig};
 
 /// A simplified Gemma-family LLM fine-tuner for Burn.
 #[derive(Parser, Debug)]
@@ -81,7 +81,8 @@ enum Command {
         #[arg(long, default_value_t = 0.1)]
         weight_decay: f64,
 
-        /// Precision for training and model weights: f32, bf16, or f16.
+        /// Safetensors weight precision for export: f32, bf16, or f16.
+        /// Training on Flex still runs with f32 math.
         #[arg(long, default_value_t = Precision::F32)]
         precision: Precision,
 

@@ -6,10 +6,12 @@
 
 //! # Precision Support
 //!
-//! This module supports three precision modes:
-//! - `F32`: Full 32-bit floating point (default, maximum stability).
+//! Safetensors checkpoints can be emitted in three floating-point dtypes:
+//! - `F32`: Full 32-bit floating point (default).
 //! - `BF16`: 16-bit bfloat16 (same dynamic range as F32, 50% memory reduction).
-//! - `F16`: 16-bit floating point (smaller dynamic range, requires loss scaling).
+//! - `F16`: 16-bit floating point (smaller dynamic range).
+//!
+//! Training on the Flex backend itself runs with F32 math.
 
 use crate::model::{CausalLmBatch, LlmModel, LlmModelConfig};
 use crate::ui::Dashboard;
@@ -17,10 +19,10 @@ use crate::ui::Dashboard;
 use burn::module::{AutodiffModule, Module};
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamW, AdamWConfig, GradientsParams};
+use burn::tensor::DType;
 use burn::train::{Learner, LearningComponentsMarker};
 
 /// The CPU training backend: autodiff over the flex (pure Rust) backend.
-/// The float type depends on the active Precision setting.
 pub type TrainBackend = burn::backend::Autodiff<burn::backend::Flex<f32, i32>>;
 /// The inference (weight-backed) CPU backend.
 pub type FlexBackend = burn::backend::Flex<f32, i32>;
@@ -65,6 +67,17 @@ impl std::str::FromStr for Precision {
     }
 }
 
+impl Precision {
+    /// Tensor dtype used when writing safetensors checkpoints.
+    pub fn safetensors_dtype(self) -> DType {
+        match self {
+            Precision::F32 => DType::F32,
+            Precision::Bf16 => DType::BF16,
+            Precision::F16 => DType::F16,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Configuration of a training run.
 pub struct TrainConfig {
@@ -80,7 +93,8 @@ pub struct TrainConfig {
     pub weight_decay: f64,
     /// Report progress every `log_every` steps.
     pub log_every: usize,
-    /// Precision for training and model weights.
+    /// Floating-point dtype for exported safetensors weights.
+    /// Training on the Flex backend still runs with F32 math.
     pub precision: Precision,
 }
 
