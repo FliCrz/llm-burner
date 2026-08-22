@@ -1,8 +1,17 @@
 //! Fine-tuning driver.
-//!
+//
 //! Runs a hand-written training loop over a fixed number of optimization
 //! steps, using burn's public [`Learner`] so the model/optimizer/scheduler
 //! plumbing stays idiomatic, while the step count is exact.
+
+//! # Precision Support
+//!
+//! Safetensors checkpoints can be emitted in three floating-point dtypes:
+//! - `F32`: Full 32-bit floating point (default).
+//! - `BF16`: 16-bit bfloat16 (same dynamic range as F32, 50% memory reduction).
+//! - `F16`: 16-bit floating point (smaller dynamic range).
+//!
+//! Training on the Flex backend itself runs with F32 math.
 
 use crate::model::{CausalLmBatch, LlmModel, LlmModelConfig};
 use crate::ui::Dashboard;
@@ -10,12 +19,64 @@ use crate::ui::Dashboard;
 use burn::module::{AutodiffModule, Module};
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamW, AdamWConfig, GradientsParams};
+use burn::tensor::DType;
 use burn::train::{Learner, LearningComponentsMarker};
 
 /// The CPU training backend: autodiff over the flex (pure Rust) backend.
 pub type TrainBackend = burn::backend::Autodiff<burn::backend::Flex<f32, i32>>;
 /// The inference (weight-backed) CPU backend.
 pub type FlexBackend = burn::backend::Flex<f32, i32>;
+
+/// Precision modes supported for training and model weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Precision {
+    /// Full 32-bit floating point.
+    F32,
+    /// 16-bit bfloat16 (same exponent range as F32).
+    Bf16,
+    /// 16-bit floating point (smaller exponent range).
+    F16,
+}
+
+impl Default for Precision {
+    fn default() -> Self {
+        Self::F32
+    }
+}
+
+impl std::fmt::Display for Precision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Precision::F32 => write!(f, "f32"),
+            Precision::Bf16 => write!(f, "bf16"),
+            Precision::F16 => write!(f, "f16"),
+        }
+    }
+}
+
+impl std::str::FromStr for Precision {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "f32" | "f" => Ok(Precision::F32),
+            "bf16" => Ok(Precision::Bf16),
+            "f16" => Ok(Precision::F16),
+            _ => Err(anyhow::anyhow!("Unknown precision: {}", s)),
+        }
+    }
+}
+
+impl Precision {
+    /// Tensor dtype used when writing safetensors checkpoints.
+    pub fn safetensors_dtype(self) -> DType {
+        match self {
+            Precision::F32 => DType::F32,
+            Precision::Bf16 => DType::BF16,
+            Precision::F16 => DType::F16,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 /// Configuration of a training run.
@@ -32,6 +93,9 @@ pub struct TrainConfig {
     pub weight_decay: f64,
     /// Report progress every `log_every` steps.
     pub log_every: usize,
+    /// Floating-point dtype for exported safetensors weights.
+    /// Training on the Flex backend still runs with F32 math.
+    pub precision: Precision,
 }
 
 impl Default for TrainConfig {
@@ -43,6 +107,7 @@ impl Default for TrainConfig {
             lr: 3e-4,
             weight_decay: 0.1,
             log_every: 10,
+            precision: Precision::default(),
         }
     }
 }
@@ -179,6 +244,7 @@ mod tests {
             lr: 1e-3,
             weight_decay: 0.0,
             log_every: 0,
+            precision: Precision::F32,
         };
 
         let device = Default::default();

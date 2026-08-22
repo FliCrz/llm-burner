@@ -9,7 +9,6 @@ use crate::config::TransformersConfig;
 use crate::data::{TokenizerStore, collect_text_files, read_corpus, sliding_windows};
 use crate::export::{export_gguf, export_safetensors};
 use crate::hf::{HfRepo, classify_download};
-use crate::model::ablation::{AblationConfig, apply_ablation};
 use crate::model::{LlmModel, LlmModelConfig};
 use crate::train::{FlexBackend, TrainBackend, TrainConfig, train_model};
 
@@ -27,8 +26,6 @@ pub struct PipelineInputs {
     pub out_dir: PathBuf,
     /// Training hyper-parameters.
     pub train: TrainConfig,
-    /// Optional refusal-direction ablation applied before training.
-    pub ablation: Option<AblationConfig>,
     /// Name recorded in GGUF metadata.
     pub model_name: String,
 }
@@ -131,7 +128,7 @@ fn copy_export_inputs(model_dir: &Path, out_dir: &Path) -> Result<()> {
 /// Run the full fine-tune-and-export pipeline.
 pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
     log::info!("loading model from `{}`", inputs.model_dir.display());
-    let (mut model, config, mut tokenizer) = load_model_from_dir(&inputs.model_dir)?;
+    let (model, config, mut tokenizer) = load_model_from_dir(&inputs.model_dir)?;
 
     if config.vocab_size == 0 {
         bail!("model config has zero vocabulary size");
@@ -140,11 +137,6 @@ pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
         bail!("seq-len must be at least 1");
     }
     tokenizer.set_seq_len(inputs.train.seq_len);
-
-    if let Some(cfg) = &inputs.ablation {
-        log::info!("applying refusal-direction ablation");
-        apply_ablation(&mut model, &tokenizer, cfg, config.max_seq_len)?;
-    }
 
     log::info!("tokenizing corpus in `{}`", inputs.dataset_dir.display());
     let files = collect_text_files(&inputs.dataset_dir, &["txt", "text", "md", "jsonl"]);
@@ -190,7 +182,7 @@ pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
         .with_context(|| format!("failed to create `{}`", inputs.out_dir.display()))?;
     copy_export_inputs(&inputs.model_dir, &inputs.out_dir)?;
     let safetensors_path = inputs.out_dir.join("model.safetensors");
-    export_safetensors(&trained, &safetensors_path)?;
+    export_safetensors(&trained, &safetensors_path, inputs.train.precision)?;
 
     let gguf_path = inputs.out_dir.join("model.gguf");
     export_gguf(

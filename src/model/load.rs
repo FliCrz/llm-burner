@@ -3,42 +3,53 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::rc::Rc;
 
 use crate::model::model::LlmModel;
 
 use anyhow::{Context, Result};
-use burn::tensor::DType;
-use burn::tensor::backend::Backend;
+use burn::tensor::{DType, backend::Backend};
 use burn_store::{
     BurnToPyTorchAdapter, ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter,
     SafetensorsStore, TensorSnapshot,
 };
 
-#[derive(Debug, Clone, Default)]
-pub struct Bf16ToF32Adapter;
+/// Adapter that casts floating-point tensors to a target dtype.
+#[derive(Debug, Clone)]
+pub(crate) struct FloatDTypeAdapter {
+    target: DType,
+}
 
-impl ModuleAdapter for Bf16ToF32Adapter {
+impl FloatDTypeAdapter {
+    pub(crate) fn new(target: DType) -> Self {
+        Self { target }
+    }
+}
+
+impl ModuleAdapter for FloatDTypeAdapter {
     fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
-        match snapshot.dtype {
-            DType::F16 | DType::BF16 => {
-                let original_data_fn = snapshot.clone_data_fn();
-                let cast_data_fn = Rc::new(move || {
-                    let data = original_data_fn()?;
-                    Ok(data.convert_dtype(DType::F32))
-                });
-
-                TensorSnapshot::from_closure(
-                    cast_data_fn,
-                    DType::F32,
-                    snapshot.shape.clone(),
-                    snapshot.path_stack.clone().unwrap_or_default(),
-                    snapshot.container_stack.clone().unwrap_or_default(),
-                    snapshot.tensor_id.unwrap_or_default(),
-                )
-            }
-            _ => snapshot.clone(),
+        let is_float = matches!(
+            snapshot.dtype,
+            DType::F64 | DType::F32 | DType::Flex32 | DType::F16 | DType::BF16
+        );
+        if !is_float || snapshot.dtype == self.target {
+            return snapshot.clone();
         }
+
+        let original_data_fn = snapshot.clone_data_fn();
+        let target = self.target;
+        let cast_data_fn = std::rc::Rc::new(move || {
+            let data = original_data_fn()?;
+            Ok(data.convert_dtype(target))
+        });
+
+        TensorSnapshot::from_closure(
+            cast_data_fn,
+            target,
+            snapshot.shape.clone(),
+            snapshot.path_stack.clone().unwrap_or_default(),
+            snapshot.container_stack.clone().unwrap_or_default(),
+            snapshot.tensor_id.unwrap_or_default(),
+        )
     }
 
     fn clone_box(&self) -> Box<dyn ModuleAdapter> {
@@ -49,14 +60,8 @@ impl ModuleAdapter for Bf16ToF32Adapter {
 /// Load weights from one or more Hugging Face `.safetensors` shard files
 /// (PyTorch layout) into the model.
 ///
-/// # Layout notes
-///
-/// PyTorch stores `Linear` weights as `[out, in]`; Burn stores them as
-/// `[in, out]`. The `PyTorchToBurnAdapter` performs the transpose on load.
-/// Norm and embedding weights are stored identically in both layouts and are
-/// left untouched. Model field names mirror Hugging Face keys 1:1
-/// (`model.layers.N.self_attn.q_proj.weight`, ...), so no key remapping is
-/// needed for the llama/gemma families.
+/// Floating-point tensors are cast to F32 while loading so Flex<f32> models can
+/// reliably ingest F16/BF16 source checkpoints.
 pub fn load_from_safetensors<B: Backend>(model: &mut LlmModel<B>, paths: &[&Path]) -> Result<()> {
     let expected: HashSet<String> = model
         .collect(None, None, false)
@@ -67,7 +72,7 @@ pub fn load_from_safetensors<B: Backend>(model: &mut LlmModel<B>, paths: &[&Path
     let mut applied = HashSet::new();
     for path in paths {
         let mut store = SafetensorsStore::from_file(path)
-            .with_from_adapter(Bf16ToF32Adapter.chain(PyTorchToBurnAdapter))
+            .with_from_adapter(FloatDTypeAdapter::new(DType::F32).chain(PyTorchToBurnAdapter))
             .allow_partial(true)
             .validate(true);
         let result = store
@@ -115,8 +120,15 @@ mod tests {
 
     type B = burn::backend::Flex<f32, i32>;
 
+    fn save_with_float_dtype(model: &LlmModel<B>, path: &Path, dtype: DType) {
+        let mut store = SafetensorsStore::from_file(path)
+            .with_to_adapter(FloatDTypeAdapter::new(dtype).chain(BurnToPyTorchAdapter))
+            .overwrite(true);
+        store.collect_from(model).unwrap();
+    }
+
     #[test]
-    fn round_trip_pytorch_layout() {
+    fn round_trip_pytorch_layout_f32() {
         let device = burn::backend::flex::FlexDevice;
         let config = LlmModelConfig::tiny();
 
@@ -127,7 +139,7 @@ mod tests {
         let source = LlmModel::<B>::new(&config, &device);
         save_to_safetensors(&source, &path).unwrap();
 
-        // Load into a model with different random initialization.
+        // Load with F32 precision
         let mut dest = LlmModel::<B>::new(&config, &device);
         load_from_safetensors(&mut dest, &[&path]).unwrap();
 
@@ -143,6 +155,54 @@ mod tests {
                 "tensor `{}` differs after round trip",
                 s.full_path()
             );
+        }
+    }
+
+    #[test]
+    fn round_trip_pytorch_layout_bf16() {
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::tiny();
+
+        // Save BF16 checkpoint, then load into a Flex<f32> model.
+        let dir = tempdir().unwrap();
+        let bf16_path = dir.path().join("model-bf16.safetensors");
+
+        let source = LlmModel::<B>::new(&config, &device);
+        save_with_float_dtype(&source, &bf16_path, DType::BF16);
+
+        let mut dest = LlmModel::<B>::new(&config, &device);
+        load_from_safetensors(&mut dest, &[&bf16_path]).unwrap();
+
+        let source_views = source.collect(None, None, false);
+        let dest_views = dest.collect(None, None, false);
+        assert_eq!(source_views.len(), dest_views.len());
+        for (s, d) in source_views.iter().zip(dest_views.iter()) {
+            assert_eq!(s.full_path(), d.full_path(), "paths differ after BF16 load");
+            assert_eq!(d.dtype, DType::F32, "loaded tensor must be F32");
+        }
+    }
+
+    #[test]
+    fn round_trip_pytorch_layout_f16() {
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::tiny();
+
+        // Save F16 checkpoint, then load into a Flex<f32> model.
+        let dir = tempdir().unwrap();
+        let f16_path = dir.path().join("model-f16.safetensors");
+
+        let source = LlmModel::<B>::new(&config, &device);
+        save_with_float_dtype(&source, &f16_path, DType::F16);
+
+        let mut dest = LlmModel::<B>::new(&config, &device);
+        load_from_safetensors(&mut dest, &[&f16_path]).unwrap();
+
+        let source_views = source.collect(None, None, false);
+        let dest_views = dest.collect(None, None, false);
+        assert_eq!(source_views.len(), dest_views.len());
+        for (s, d) in source_views.iter().zip(dest_views.iter()) {
+            assert_eq!(s.full_path(), d.full_path(), "paths differ after F16 load");
+            assert_eq!(d.dtype, DType::F32, "loaded tensor must be F32");
         }
     }
 
