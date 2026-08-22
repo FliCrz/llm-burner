@@ -171,8 +171,8 @@ impl<B: Backend> Transformer<B> {
     /// after decoder layer `after_layer` (0-indexed), skipping the final norm.
     ///
     /// Used to probe intermediate activations (e.g. refusal-direction
-    /// extraction); [`Transformer::forward`] should be preferred everywhere
-    /// else.
+    /// extraction); the regular [`Transformer::forward`] should be preferred
+    /// everywhere else.
     pub fn forward_hidden_after_layer(
         &self,
         input: Tensor<B, 2, Int>,

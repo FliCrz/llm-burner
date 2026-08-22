@@ -1,5 +1,5 @@
-//! Export a trained model to GGUF (Q4_K, via the `Q4K` scheme) and to
-//! PyTorch-layout `.safetensors`.
+/// Export a trained model to GGUF (Q4_K, via the `Q4K` scheme) and to
+/// PyTorch-layout `.safetensors`.
 
 use std::path::Path;
 

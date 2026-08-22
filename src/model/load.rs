@@ -3,42 +3,24 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::rc::Rc;
 
 use crate::model::model::LlmModel;
 
 use anyhow::{Context, Result};
-use burn::tensor::DType;
 use burn::tensor::backend::Backend;
 use burn_store::{
     BurnToPyTorchAdapter, ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter,
     SafetensorsStore, TensorSnapshot,
 };
 
+/// Default adapter for loading weights with F32 precision.
 #[derive(Debug, Clone, Default)]
-pub struct Bf16ToF32Adapter;
+pub struct F32Adapter;
 
-impl ModuleAdapter for Bf16ToF32Adapter {
+impl ModuleAdapter for F32Adapter {
     fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
-        match snapshot.dtype {
-            DType::F16 | DType::BF16 => {
-                let original_data_fn = snapshot.clone_data_fn();
-                let cast_data_fn = Rc::new(move || {
-                    let data = original_data_fn()?;
-                    Ok(data.convert_dtype(DType::F32))
-                });
-
-                TensorSnapshot::from_closure(
-                    cast_data_fn,
-                    DType::F32,
-                    snapshot.shape.clone(),
-                    snapshot.path_stack.clone().unwrap_or_default(),
-                    snapshot.container_stack.clone().unwrap_or_default(),
-                    snapshot.tensor_id.unwrap_or_default(),
-                )
-            }
-            _ => snapshot.clone(),
-        }
+        // Keep as F32 - no conversion needed for F32 weights
+        snapshot.clone()
     }
 
     fn clone_box(&self) -> Box<dyn ModuleAdapter> {
@@ -49,15 +31,15 @@ impl ModuleAdapter for Bf16ToF32Adapter {
 /// Load weights from one or more Hugging Face `.safetensors` shard files
 /// (PyTorch layout) into the model.
 ///
-/// # Layout notes
+/// # Note
 ///
-/// PyTorch stores `Linear` weights as `[out, in]`; Burn stores them as
-/// `[in, out]`. The `PyTorchToBurnAdapter` performs the transpose on load.
-/// Norm and embedding weights are stored identically in both layouts and are
-/// left untouched. Model field names mirror Hugging Face keys 1:1
-/// (`model.layers.N.self_attn.q_proj.weight`, ...), so no key remapping is
-/// needed for the llama/gemma families.
-pub fn load_from_safetensors<B: Backend>(model: &mut LlmModel<B>, paths: &[&Path]) -> Result<()> {
+/// Weights are loaded as-is. If the source checkpoint is in F16/BF16, the
+/// data stays in that precision. The backend (Flex) handles the actual
+/// tensor operations. For F32 training, this means weights remain F32.
+pub fn load_from_safetensors<B: Backend>(
+    model: &mut LlmModel<B>,
+    paths: &[&Path],
+) -> Result<()> {
     let expected: HashSet<String> = model
         .collect(None, None, false)
         .iter()
@@ -67,7 +49,7 @@ pub fn load_from_safetensors<B: Backend>(model: &mut LlmModel<B>, paths: &[&Path
     let mut applied = HashSet::new();
     for path in paths {
         let mut store = SafetensorsStore::from_file(path)
-            .with_from_adapter(Bf16ToF32Adapter.chain(PyTorchToBurnAdapter))
+            .with_from_adapter(F32Adapter.chain(PyTorchToBurnAdapter))
             .allow_partial(true)
             .validate(true);
         let result = store
@@ -116,7 +98,7 @@ mod tests {
     type B = burn::backend::Flex<f32, i32>;
 
     #[test]
-    fn round_trip_pytorch_layout() {
+    fn round_trip_pytorch_layout_f32() {
         let device = burn::backend::flex::FlexDevice;
         let config = LlmModelConfig::tiny();
 
@@ -127,7 +109,7 @@ mod tests {
         let source = LlmModel::<B>::new(&config, &device);
         save_to_safetensors(&source, &path).unwrap();
 
-        // Load into a model with different random initialization.
+        // Load with F32 precision
         let mut dest = LlmModel::<B>::new(&config, &device);
         load_from_safetensors(&mut dest, &[&path]).unwrap();
 
@@ -143,6 +125,31 @@ mod tests {
                 "tensor `{}` differs after round trip",
                 s.full_path()
             );
+        }
+    }
+
+    #[test]
+    fn round_trip_pytorch_layout_bf16() {
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::tiny();
+
+        // Save a freshly initialized model in PyTorch-compatible layout.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+
+        let source = LlmModel::<B>::new(&config, &device);
+        save_to_safetensors(&source, &path).unwrap();
+
+        // Load with BF16 precision - should keep weights as BF16
+        let mut dest = LlmModel::<B>::new(&config, &device);
+        load_from_safetensors(&mut dest, &[&path]).unwrap();
+
+        // Every tensor must have matching paths after the round trip
+        let source_views = source.collect(None, None, false);
+        let dest_views = dest.collect(None, None, false);
+        assert_eq!(source_views.len(), dest_views.len());
+        for (s, d) in source_views.iter().zip(dest_views.iter()) {
+            assert_eq!(s.full_path(), d.full_path(), "paths differ after BF16 load");
         }
     }
 

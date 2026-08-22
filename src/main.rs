@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use llm_burner::data::HfDataset;
 use llm_burner::hf::HfRepo;
 use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir, run_pipeline};
-use llm_burner::train::TrainConfig;
+use llm_burner::train::{TrainConfig, Precision};
 
 /// A simplified Gemma-family LLM fine-tuner for Burn.
 #[derive(Parser, Debug)]
@@ -81,29 +81,9 @@ enum Command {
         #[arg(long, default_value_t = 0.1)]
         weight_decay: f64,
 
-        /// Remove the model's refusal direction before fine-tuning
-        /// (abliteration). The change is baked into the exported weights.
-        #[arg(long)]
-        ablate_refusal: bool,
-
-        /// Decoder layer used to measure the refusal direction
-        /// (default: ~2/3 of the network depth).
-        #[arg(long)]
-        refusal_layer: Option<usize>,
-
-        /// Ablation strength within [0, 1]; 1 fully removes the component.
-        #[arg(long, default_value_t = 1.0)]
-        ablate_scale: f64,
-
-        /// File of newline-separated harmful probes (overrides built-ins;
-        /// blank lines and `#` comments are ignored).
-        #[arg(long)]
-        harmful_file: Option<PathBuf>,
-
-        /// File of newline-separated harmless probes (overrides built-ins;
-        /// blank lines and `#` comments are ignored).
-        #[arg(long)]
-        harmless_file: Option<PathBuf>,
+        /// Precision for training and model weights: f32, bf16, or f16.
+        #[arg(long, default_value_t = Precision::F32)]
+        precision: Precision,
 
         /// Concurrent file downloads when fetching the model/dataset.
         #[arg(long, default_value_t = 8)]
@@ -181,12 +161,8 @@ fn main() -> anyhow::Result<()> {
             seq_len,
             lr,
             weight_decay,
-            ablate_refusal,
-            refusal_layer,
-            ablate_scale,
-            harmful_file,
-            harmless_file,
             max_workers,
+            precision,
         } => {
             let (mdir, ddir) =
                 resolve_inputs(&out, model, model_dir, dataset, dataset_dir, max_workers)?;
@@ -197,9 +173,8 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if ablate_refusal && !(0.0..=1.0).contains(&ablate_scale) {
-                anyhow::bail!("`--ablate-scale` must be within [0, 1], got {ablate_scale}");
-            }
+            log::info!("training precision: {:?}", precision);
+            log::info!("backend: Flex (CPU, autodiff over f32 accumulations)");
 
             let inputs = PipelineInputs {
                 model_dir: mdir,
@@ -212,13 +187,8 @@ fn main() -> anyhow::Result<()> {
                     lr,
                     weight_decay,
                     log_every: (steps / 20).max(1),
+                    precision,
                 },
-                ablation: ablate_refusal.then_some(llm_burner::model::ablation::AblationConfig {
-                    direction_layer: refusal_layer,
-                    scale: ablate_scale,
-                    harmful_file,
-                    harmless_file,
-                }),
                 model_name: "llm-burner-finetune".to_string(),
             };
             run_pipeline(&inputs)?;
