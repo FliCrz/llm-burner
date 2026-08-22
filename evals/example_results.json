@@ -1,0 +1,10 @@
+{
+  "results": [
+    {"id": "capital_france", "output": "Paris"},
+    {"id": "sum_two_plus_two", "output": "4"},
+    {"id": "sky_color", "output": "The sky is blue."},
+    {"id": "capital_japan", "output": "Tokyo"},
+    {"id": "greeting", "output": "Hello, my name is John"},
+    {"id": "opposite_up", "output": "down"}
+  ]
+}

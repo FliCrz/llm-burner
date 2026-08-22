@@ -1,0 +1,48 @@
+{
+  "name": "inference-eval-basic",
+  "description": "Simple, programmatically scor-able prompts for evaluating a trained model.",
+  "tasks": [
+    {
+      "id": "capital_france",
+      "prompt": "What is the capital of France?",
+      "mode": "exact",
+      "expected": ["paris"],
+      "weight": 1.0
+    },
+    {
+      "id": "sum_two_plus_two",
+      "prompt": "What is 2 + 2?",
+      "mode": "exact",
+      "expected": ["4", "four"],
+      "weight": 1.0
+    },
+    {
+      "id": "sky_color",
+      "prompt": "What color is the sky on a clear day?",
+      "mode": "contains",
+      "expected": ["blue"],
+      "weight": 1.0
+    },
+    {
+      "id": "capital_japan",
+      "prompt": "What is the capital of Japan?",
+      "mode": "exact",
+      "expected": ["tokyo"],
+      "weight": 1.0
+    },
+    {
+      "id": "greeting",
+      "prompt": "Complete the sentence: Hello, my name is",
+      "mode": "contains",
+      "expected": ["john"],
+      "weight": 1.0
+    },
+    {
+      "id": "opposite_up",
+      "prompt": "What is the opposite of 'up'?",
+      "mode": "exact",
+      "expected": ["down"],
+      "weight": 1.0
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+[package]
+name = "llm-burner"
+version = "0.1.0"
+edition = "2024"
+description = "Download Hugging Face models, fine-tune a Gemma-style transformer with Burn, and export to safetensors and GGUF."
+
+[features]
+default = ["flex"]
+flex = ["burn/flex", "burn/simd", "burn/autotune"]
+gpu = ["burn/wgpu", "burn/vulkan", "burn/fusion"]
+gpu-cuda = ["burn/wgpu", "burn/cuda", "burn/fusion"]
+
+[dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["std", "train", "dataset", "tui", "metrics", "store", "sqlite-bundled", "autodiff", "flex"] }
+burn-core = { version = "0.21.0", default-features = false, features = ["std"] }
+burn-store = { version = "0.21.0", default-features = false, features = ["std"] }
+rlx-gguf = "0.2.14"
+hf-hub = { version = "1.0", features = ["blocking"] }
+tokenizers = "0.21"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"
+ratatui = { version = "0.30", features = ["all-widgets", "crossterm"] }
+
+[dev-dependencies]
+tempfile = "3"

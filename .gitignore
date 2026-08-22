@@ -1,0 +1,7 @@
+./target
+./models
+./datasets
+./artifacts
+./out
+**/*.gguf
+.oz
