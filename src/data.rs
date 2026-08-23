@@ -532,7 +532,7 @@ pub fn build_causal_batch_from_flat<B: burn::tensor::backend::Backend>(
 
     let input = Tensor::from_data(TensorData::new(flat.to_vec(), [rows, seq_len]), device);
     let target = Tensor::from_data(TensorData::new(targets, [rows, seq_len]), device);
-    CausalLmBatch::new(input, target)
+    CausalLmBatch::new_masked(input, target, pad_id)
 }
 
 /// Recursively collect files under `dir` with one of the given extensions.

@@ -151,8 +151,17 @@ impl<B: Backend> CausalAttention<B> {
 
         let scale = (self.head_dim as f64).sqrt();
         let num_groups = self.n_heads / self.n_kv_heads;
-        let k = k.repeat_dim(1, num_groups);
-        let v = v.repeat_dim(1, num_groups);
+        // Expand each KV head to its contiguous group of query heads
+        // (HF `repeat_kv`: head h uses kv head h / num_groups). A plain
+        // `repeat_dim(1, …)` would interleave heads instead of repeating
+        // them block-wise, silently mispairing queries and keys.
+        let expand = |t: Tensor<B, 4>| -> Tensor<B, 4> {
+            let t = t.reshape([batch, self.n_kv_heads, 1, seq, self.head_dim]);
+            t.repeat_dim(2, num_groups)
+                .reshape([batch, self.n_heads, seq, self.head_dim])
+        };
+        let k = expand(k);
+        let v = expand(v);
 
         let scores = (q / scale).matmul(k.transpose());
 
