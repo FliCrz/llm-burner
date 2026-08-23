@@ -170,7 +170,7 @@ pub fn run_gpu_probe(_precision: Precision) -> anyhow::Result<()> {
     anyhow::bail!("gpu-probe requires a GPU build (--features gpu)")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
