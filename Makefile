@@ -66,12 +66,12 @@ clean:
 	@echo "`target` folder deleted."
 
 install:
-	@echo "Moving binary to `$(INSTALL_DIR)`."
+	@echo "Moving binary to $(INSTALL_DIR)."
 	mv target/release/llm-burner $(INSTALL_DIR)
 	@echo "Install done."
 
 uninstall:
-	@echo "Removing binary from `$(INSTALL_DIR)`."
+	@echo "Removing binary from $(INSTALL_DIR)."
 	rm $(INSTALL_DIR)/llm-burner
 	@echo "Deleted binary."
 

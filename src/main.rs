@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use llm_burner::data::HfDataset;
 use llm_burner::hf::HfRepo;
-use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir, run_pipeline};
+use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir};
 use llm_burner::train::{Precision, TrainConfig};
 
 /// A simplified Gemma-family LLM fine-tuner for Burn.
@@ -121,6 +121,16 @@ enum Command {
         max_workers: usize,
     },
 
+    /// Validate that the GPU driver can compile and run kernels in a given
+    /// precision (exit 0) or die trying (any other exit). Used internally as
+    /// the child process of a pre-flight probe before half-precision runs.
+    #[command(hide = true)]
+    GpuProbe {
+        /// Precision to validate on the GPU backend.
+        #[arg(long)]
+        precision: Precision,
+    },
+
     /// Export a trained model to GGUF format.
     Export {
         /// Model directory containing config.json, tokenizer.json, and .safetensors.
@@ -225,7 +235,6 @@ fn main() -> anyhow::Result<()> {
             }
 
             log::info!("training precision: {:?}", precision);
-            log::info!("backend: {}", llm_burner::train::backend_label());
 
             let inputs = PipelineInputs {
                 model_dir: mdir,
@@ -248,10 +257,47 @@ fn main() -> anyhow::Result<()> {
                     harmful_file,
                     harmless_file,
                 }),
-                model_name: "llm-burner-finetune".to_string(),
             };
-            run_pipeline(&inputs)?;
+
+            // Pre-flight: half-precision kernels can segfault buggy GPU
+            // drivers (Mesa RADV on some AMD iGPUs), which is unrecoverable
+            // in-process. Validate the requested dtype in a throwaway child
+            // and fall back to CPU training when it does not come back clean.
+            #[cfg(feature = "gpu")]
+            let gpu_ok = {
+                use llm_burner::probe::{ProbeOutcome, spawn_probe};
+                let exe = std::env::current_exe()
+                    .context("cannot locate own executable for the GPU probe")?;
+                match spawn_probe(&exe, precision, llm_burner::probe::PROBE_TIMEOUT) {
+                    ProbeOutcome::Success => true,
+                    outcome => {
+                        log::warn!(
+                            "GPU probe for {precision} did not succeed: {outcome}; \
+                             falling back to the CPU backend (f32 compute, \
+                             {precision} checkpoint load/export)"
+                        );
+                        false
+                    }
+                }
+            };
+            #[cfg(feature = "gpu")]
+            if gpu_ok {
+                log::info!("backend: {}", llm_burner::train::backend_label());
+                llm_burner::pipeline::run_pipeline(&inputs)?;
+            } else {
+                llm_burner::pipeline::run_pipeline_on_cpu(&inputs)?;
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                log::info!("backend: {}", llm_burner::train::backend_label());
+                llm_burner::pipeline::run_pipeline_on_cpu(&inputs)?;
+            }
+
             println!("outputs in `{}`", inputs.out_dir.display());
+        }
+        Command::GpuProbe { precision } => {
+            init_stderr_logger();
+            llm_burner::probe::run_gpu_probe(precision)?;
         }
         Command::Export {
             model_dir,

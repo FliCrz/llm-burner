@@ -234,9 +234,7 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
     }
 
     if let Some((shape, dtype, bytes)) = tied_output {
-        log::info!(
-            "tied embeddings: writing token_embd matrix as output.weight for llama.cpp"
-        );
+        log::info!("tied embeddings: writing token_embd matrix as output.weight for llama.cpp");
         writer
             .add_tensor_bytes("output.weight".to_string(), shape, dtype, bytes)
             .context("failed to add tensor `output.weight`")?;
@@ -252,25 +250,28 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
 fn add_model_metadata(writer: &mut GgufWriter, config: &LlmModelConfig, arch: &str) {
     let u = |v: usize| MetaValue::U32(v as u32);
     let kv = |suffix: &str| format!("{arch}.{suffix}");
-    writer.set_meta(&kv("context_length"), u(config.max_seq_len));
-    writer.set_meta(&kv("embedding_length"), u(config.d_model));
-    writer.set_meta(&kv("block_count"), u(config.n_layers));
-    writer.set_meta(&kv("feed_forward_length"), u(config.intermediate_size));
-    writer.set_meta(&kv("attention.head_count"), u(config.n_heads));
-    writer.set_meta(&kv("attention.head_count_kv"), u(config.n_kv_heads));
-    writer.set_meta(&kv("vocab_size"), u(config.vocab_size));
+    writer.set_meta(kv("context_length"), u(config.max_seq_len));
+    writer.set_meta(kv("embedding_length"), u(config.d_model));
+    writer.set_meta(kv("block_count"), u(config.n_layers));
+    writer.set_meta(kv("feed_forward_length"), u(config.intermediate_size));
+    writer.set_meta(kv("attention.head_count"), u(config.n_heads));
+    writer.set_meta(kv("attention.head_count_kv"), u(config.n_kv_heads));
+    writer.set_meta(kv("vocab_size"), u(config.vocab_size));
     writer.set_meta(
-        &kv("attention.layer_norm_rms_epsilon"),
+        kv("attention.layer_norm_rms_epsilon"),
         MetaValue::F32(config.rms_eps as f32),
     );
-    writer.set_meta(&kv("rope.freq_base"), MetaValue::F32(config.rope_theta as f32));
     writer.set_meta(
-        &kv("attention.sliding_window"),
+        kv("rope.freq_base"),
+        MetaValue::F32(config.rope_theta as f32),
+    );
+    writer.set_meta(
+        kv("attention.sliding_window"),
         MetaValue::U32(config.sliding_window.unwrap_or(0) as u32),
     );
     // llama.cpp requires n_rot == n_embd / n_head for the llama arch, so this
     // must be the full per-head dimension (NOT half of it).
-    writer.set_meta(&kv("rope.dimension_count"), u(config.head_dim));
+    writer.set_meta(kv("rope.dimension_count"), u(config.head_dim));
 }
 
 /// GGUF token type for padding placeholders (`TokenType::UNUSED`).
@@ -449,7 +450,10 @@ mod tests {
             gguf_tensor_name("model.layers.2.self_attn.v_proj.bias"),
             Some("blk.2.attn_v.bias".to_string())
         );
-        assert_eq!(gguf_tensor_name("model.layers.0.self_attn.o_proj.bias"), None);
+        assert_eq!(
+            gguf_tensor_name("model.layers.0.self_attn.o_proj.bias"),
+            None
+        );
         assert_eq!(
             gguf_tensor_name("model.layers.0.mlp.up_proj.weight"),
             Some("blk.0.ffn_up.weight".to_string())
@@ -720,7 +724,10 @@ mod tests {
         );
         for (n, id) in [
             (1usize, config.vocab_size / 2),
-            (config.vocab_size - short_config.vocab_size, config.vocab_size - 1),
+            (
+                config.vocab_size - short_config.vocab_size,
+                config.vocab_size - 1,
+            ),
         ] {
             assert!(
                 matches!(tokens[id], MetaValue::String(ref s) if *s == format!("[PAD{n}]")),
@@ -779,7 +786,10 @@ mod tests {
             file.tensors["output.weight"].shape,
             vec![config.d_model, config.vocab_size]
         );
-        assert_eq!(file.tensors["output.weight"].dtype, file.tensors["token_embd.weight"].dtype);
+        assert_eq!(
+            file.tensors["output.weight"].dtype,
+            file.tensors["token_embd.weight"].dtype
+        );
 
         // The output projection must be a copy of the embedding matrix.
         let (embd, _) = file.dequant_f32("token_embd.weight").unwrap();
@@ -852,8 +862,7 @@ mod tests {
         let config = LlmModelConfig::tiny();
         let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
 
-        let export = |tokenizer: &crate::data::TokenizerStore,
-                      dir: &tempfile::TempDir| {
+        let export = |tokenizer: &crate::data::TokenizerStore, dir: &tempfile::TempDir| {
             let path = dir.path().join("family.gguf");
             export_gguf(&model, &config, tokenizer, &path, "test").unwrap();
             GgufFile::from_path(&path).unwrap()
@@ -875,7 +884,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let spm_file = export(&crate::data::TokenizerStore::from_file(&spm_path).unwrap(), &spm_dir);
+        let spm_file = export(
+            &crate::data::TokenizerStore::from_file(&spm_path).unwrap(),
+            &spm_dir,
+        );
         assert!(
             matches!(&spm_file.metadata["tokenizer.ggml.model"], MetaValue::String(s) if s == "llama")
         );
@@ -890,7 +902,11 @@ mod tests {
         assert!(
             matches!(&bpe_file.metadata["tokenizer.ggml.model"], MetaValue::String(s) if s == "gpt2")
         );
-        assert!(!bpe_file.metadata.contains_key("tokenizer.ggml.bos_token_id"));
+        assert!(
+            !bpe_file
+                .metadata
+                .contains_key("tokenizer.ggml.bos_token_id")
+        );
         assert!(matches!(
             bpe_file.metadata["tokenizer.ggml.add_bos_token"],
             MetaValue::Bool(false)
@@ -989,7 +1005,9 @@ mod tests {
         assert!(!file.metadata.contains_key("llama.vocab_size"));
 
         // Tokenizer pre.
-        assert!(matches!(&file.metadata["tokenizer.ggml.pre"], MetaValue::String(s) if s == "qwen2"));
+        assert!(
+            matches!(&file.metadata["tokenizer.ggml.pre"], MetaValue::String(s) if s == "qwen2")
+        );
 
         // Q/K must be plain transposes (no rope row permutation): rebuild the
         // expected PyTorch-layout matrix from the burn snapshot.
@@ -998,10 +1016,7 @@ mod tests {
             "model.layers.0.self_attn.q_proj.weight",
             "model.layers.0.self_attn.k_proj.weight",
         ] {
-            let s = snapshots
-                .iter()
-                .find(|s| s.full_path() == hf_name)
-                .unwrap();
+            let s = snapshots.iter().find(|s| s.full_path() == hf_name).unwrap();
             let [d0, d1] = s.shape.dims::<2>();
             let floats = s.to_data().unwrap().to_vec::<f32>().unwrap();
             let expected = transpose(&floats, d0, d1);

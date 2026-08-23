@@ -17,7 +17,6 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 
-use ratatui::{DefaultTerminal, Frame, Terminal, init, restore};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::QueueableCommand;
 use ratatui::crossterm::terminal::{
@@ -27,6 +26,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline};
+use ratatui::{DefaultTerminal, Frame, Terminal, init, restore};
 
 /// A progress event sent from the training loop to the dashboard thread.
 enum Event {
@@ -102,8 +102,9 @@ fn run(rx: Receiver<Event>, steps: usize, redirect_log: Option<PathBuf>) {
     // A private handle to the real terminal, independent of fd 1/2 targets.
     #[cfg(unix)]
     let tty_file = acquire_tty();
-    let redirect = redirect_log.as_deref().and_then(|path| {
-        match OutputRedirect::open(path) {
+    let redirect = redirect_log
+        .as_deref()
+        .and_then(|path| match OutputRedirect::open(path) {
             Ok(r) => Some(r),
             Err(err) => {
                 eprintln!(
@@ -112,15 +113,12 @@ fn run(rx: Receiver<Event>, steps: usize, redirect_log: Option<PathBuf>) {
                 );
                 None
             }
-        }
-    });
+        });
 
     #[cfg(unix)]
     let mut screen = match tty_file.as_ref() {
         Some(tty) => {
-            let term_handle = tty
-                .try_clone()
-                .expect("duplicated tty handle stays valid");
+            let term_handle = tty.try_clone().expect("duplicated tty handle stays valid");
             match enter_terminal(term_handle) {
                 Ok(terminal) => Screen::Tty {
                     terminal,

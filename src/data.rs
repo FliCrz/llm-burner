@@ -379,7 +379,8 @@ impl WindowStore {
         self.tokens.extend_from_slice(tokens);
         let rem = self.tokens.len() % self.seq_len;
         if rem > 0 {
-            self.tokens.resize(self.tokens.len() + (self.seq_len - rem), pad_id);
+            self.tokens
+                .resize(self.tokens.len() + (self.seq_len - rem), pad_id);
         }
     }
 
@@ -699,8 +700,7 @@ mod tests {
 
         let tokenizer = word_pseudo_tokenizer();
         // 4-byte chunk target forces an encode call per line.
-        let (store, total) =
-            tokenize_corpus_sized(&tokenizer, &[a], 3, 0, 4).unwrap();
+        let (store, total) = tokenize_corpus_sized(&tokenizer, &[a], 3, 0, 4).unwrap();
 
         // Same stream as the whole-file encoding of "one two\nthree four".
         assert_eq!(total, 4);

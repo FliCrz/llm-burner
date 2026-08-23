@@ -62,6 +62,13 @@ use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::train::{Learner, LearningComponentsMarker};
 
 /// Precision modes supported for training and model weights.
+///
+/// On GPU builds the requested dtype drives the whole stack (checkpoint load,
+/// forward/backward math, optimizer state, export). If the GPU probe rejects
+/// the dtype (buggy driver), or on CPU-only builds, training computes in f32
+/// while the checkpoint load/export still honor the requested dtype — fp32
+/// master weights are also the numerically safer recipe for half-precision
+/// AdamW.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Precision {
     /// Full 32-bit floating point.
@@ -189,12 +196,14 @@ where
         .init::<B, LlmModel<B>>();
     let lr_scheduler: burn::optim::LearningRate = cfg.lr;
 
-    let mut learner = Learner::<LearningComponentsMarker<
-        B,
-        burn::optim::LearningRate,
-        LlmModel<B>,
-        OptimizerAdaptor<AdamW, LlmModel<B>, B>,
-    >>::new(model, optimizer, lr_scheduler);
+    let mut learner = Learner::<
+        LearningComponentsMarker<
+            B,
+            burn::optim::LearningRate,
+            LlmModel<B>,
+            OptimizerAdaptor<AdamW, LlmModel<B>, B>,
+        >,
+    >::new(model, optimizer, lr_scheduler);
     learner.lr_step();
 
     // A trailing partial batch is dropped so the step count stays exact.
@@ -261,6 +270,8 @@ pub fn train_model_from_config<B: AutodiffBackend>(config: &LlmModelConfig) -> L
 
 #[cfg(test)]
 mod tests {
+    // Only the gpu-gated integration test needs the parent scope.
+    #[cfg(not(feature = "gpu"))]
     use super::*;
 
     #[test]
@@ -305,12 +316,7 @@ mod tests {
         };
 
         let device = Default::default();
-        let init_batch = build_batch::<InferBackend>(
-            windows.window_tokens(0, 2),
-            8,
-            0,
-            &device,
-        );
+        let init_batch = build_batch::<InferBackend>(windows.window_tokens(0, 2), 8, 0, &device);
         let init_loss: f32 = model
             .valid()
             .forward_classification(init_batch)
@@ -319,12 +325,7 @@ mod tests {
 
         let trained = train_model(model, &windows, 0, &cfg);
 
-        let final_batch = build_batch::<InferBackend>(
-            windows.window_tokens(0, 2),
-            8,
-            0,
-            &device,
-        );
+        let final_batch = build_batch::<InferBackend>(windows.window_tokens(0, 2), 8, 0, &device);
         let final_loss: f32 = trained
             .forward_classification(final_batch)
             .loss

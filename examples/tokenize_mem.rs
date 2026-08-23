@@ -26,14 +26,15 @@ fn kib_as_gib(kib: u64) -> f64 {
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let model_dir = args.next().expect("usage: tokenize_mem <model_dir> <dataset_dir>");
-    let dataset_dir = args.next().expect("usage: tokenize_mem <model_dir> <dataset_dir>");
+    let model_dir = args
+        .next()
+        .expect("usage: tokenize_mem <model_dir> <dataset_dir>");
+    let dataset_dir = args
+        .next()
+        .expect("usage: tokenize_mem <model_dir> <dataset_dir>");
 
     let tokenizer = TokenizerStore::from_file(&Path::new(&model_dir).join("tokenizer.json"))?;
-    let files = collect_text_files(
-        Path::new(&dataset_dir),
-        &["txt", "text", "md", "jsonl"],
-    );
+    let files = collect_text_files(Path::new(&dataset_dir), &["txt", "text", "md", "jsonl"]);
     anyhow::ensure!(!files.is_empty(), "no text files found in `{dataset_dir}`");
     let total_bytes: u64 = files
         .iter()

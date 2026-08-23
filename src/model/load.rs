@@ -77,9 +77,7 @@ pub fn load_from_safetensors<B: Backend>(
     let mut applied = HashSet::new();
     for path in paths {
         let mut store = SafetensorsStore::from_file(path)
-            .with_from_adapter(
-                FloatDTypeAdapter::new(target_dtype).chain(PyTorchToBurnAdapter),
-            )
+            .with_from_adapter(FloatDTypeAdapter::new(target_dtype).chain(PyTorchToBurnAdapter))
             .allow_partial(true)
             .validate(true);
         let result = store
