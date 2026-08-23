@@ -40,6 +40,17 @@ fn gguf_tensor_name(path: &str) -> Option<String> {
             };
             Some(format!("blk.{layer}.{proj_name}.weight"))
         }
+        ["model", "layers", layer, "self_attn", proj, "bias"] => {
+            let proj_name = match *proj {
+                "q_proj" => "attn_q",
+                "k_proj" => "attn_k",
+                "v_proj" => "attn_v",
+                // Qwen2 trains no output-projection bias; anything else is
+                // not a tensor this exporter knows how to place.
+                _ => return None,
+            };
+            Some(format!("blk.{layer}.{proj_name}.bias"))
+        }
         ["model", "layers", layer, "mlp", proj, "weight"] => {
             let proj_name = match *proj {
                 "gate_proj" => "ffn_gate",
@@ -132,20 +143,18 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
     writer.set_arch(arch);
     writer.set_meta("general.name", MetaValue::String(name.to_string()));
     writer.set_meta("general.file_type", MetaValue::U32(15)); // Q4_K
-    add_model_metadata(&mut writer, config);
-    add_tokenizer_metadata(&mut writer, tokenizer, "llama");
+    add_model_metadata(&mut writer, config, arch);
+    let pre = if arch == "qwen2" { Some("qwen2") } else { None };
+    add_tokenizer_metadata(&mut writer, tokenizer, config.vocab_size, pre);
+
+    // Tied-embedding models have no `lm_head` parameter, so the loop below
+    // never produces an `output.weight`. llama.cpp would fall back to using
+    // `token_embd` as the output projection, but that fallback yields garbage
+    // output in practice — the official HF converter duplicates the embedding
+    // matrix into `output.weight`, and so do we.
+    let mut tied_output: Option<(Vec<usize>, GgmlType, Vec<u8>)> = None;
 
     for snapshot in &snapshots {
-        // When embeddings are tied, the output projection (lm_head) is the
-        // same matrix as the token embeddings; do NOT write a separate
-        // output.weight – llama.cpp will use token_embd.weight instead.
-        if config.tie_word_embeddings && snapshot.full_path() == "lm_head.weight" {
-            log::warn!(
-                "skipping output.weight (tied embeddings); token_embd.weight will be used as output projection"
-            );
-            continue;
-        }
-
         let Some(gguf_name) = gguf_tensor_name(&snapshot.full_path()) else {
             log::warn!("skipping untranslated tensor `{}`", snapshot.full_path());
             continue;
@@ -160,9 +169,18 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
         let data = snapshot
             .to_data()
             .map_err(|e| anyhow::anyhow!("failed to read `{}`: {e}", snapshot.full_path()))?;
-        let floats: Vec<f32> = data.to_vec::<f32>().map_err(|e| {
-            anyhow::anyhow!("failed to read `{}` as f32: {e}", snapshot.full_path())
-        })?;
+        // The trained model may hold half-precision weights; GGUF writing and
+        // Q4_K quantization both operate on f32, so convert any float dtype.
+        let floats: Vec<f32> = if data.dtype == burn::tensor::DType::F32 {
+            data.to_vec::<f32>().map_err(|e| {
+                anyhow::anyhow!("failed to read `{}` as f32: {e}", snapshot.full_path())
+            })?
+        } else {
+            let converted = data.convert_dtype(burn::tensor::DType::F32);
+            converted.to_vec::<f32>().map_err(|e| {
+                anyhow::anyhow!("failed to read `{}` as f32: {e}", snapshot.full_path())
+            })?
+        };
 
         // GGUF declares dimensions fastest-first: ne[0] is the contiguous
         // axis, i.e. ne is the reverse of the row-major shape of the stored
@@ -207,9 +225,19 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
         let bytes = quantize(&floats, dtype)
             .map_err(|e| anyhow::anyhow!("failed to quantize `{gguf_name}` with {dtype:?}: {e}"))?;
 
+        if gguf_name == "token_embd.weight" && config.tie_word_embeddings {
+            tied_output = Some((shape_vec.clone(), dtype, bytes.clone()));
+        }
         writer
             .add_tensor_bytes(gguf_name.clone(), shape_vec, dtype, bytes)
             .with_context(|| format!("failed to add tensor `{gguf_name}`"))?;
+    }
+
+    if let Some((shape, dtype, bytes)) = tied_output {
+        log::info!("tied embeddings: writing token_embd matrix as output.weight for llama.cpp");
+        writer
+            .add_tensor_bytes("output.weight".to_string(), shape, dtype, bytes)
+            .context("failed to add tensor `output.weight`")?;
     }
 
     writer
@@ -219,59 +247,143 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
     Ok(())
 }
 
-fn add_model_metadata(writer: &mut GgufWriter, config: &LlmModelConfig) {
+fn add_model_metadata(writer: &mut GgufWriter, config: &LlmModelConfig, arch: &str) {
     let u = |v: usize| MetaValue::U32(v as u32);
-    writer.set_meta("llama.context_length", u(config.max_seq_len));
-    writer.set_meta("llama.embedding_length", u(config.d_model));
-    writer.set_meta("llama.block_count", u(config.n_layers));
-    writer.set_meta("llama.feed_forward_length", u(config.intermediate_size));
-    writer.set_meta("llama.attention.head_count", u(config.n_heads));
-    writer.set_meta("llama.attention.head_count_kv", u(config.n_kv_heads));
-    writer.set_meta("llama.vocab_size", u(config.vocab_size));
+    let kv = |suffix: &str| format!("{arch}.{suffix}");
+    writer.set_meta(kv("context_length"), u(config.max_seq_len));
+    writer.set_meta(kv("embedding_length"), u(config.d_model));
+    writer.set_meta(kv("block_count"), u(config.n_layers));
+    writer.set_meta(kv("feed_forward_length"), u(config.intermediate_size));
+    writer.set_meta(kv("attention.head_count"), u(config.n_heads));
+    writer.set_meta(kv("attention.head_count_kv"), u(config.n_kv_heads));
+    writer.set_meta(kv("vocab_size"), u(config.vocab_size));
     writer.set_meta(
-        "llama.attention.layer_norm_rms_epsilon",
+        kv("attention.layer_norm_rms_epsilon"),
         MetaValue::F32(config.rms_eps as f32),
     );
     writer.set_meta(
-        "llama.rope.freq_base",
+        kv("rope.freq_base"),
         MetaValue::F32(config.rope_theta as f32),
     );
     writer.set_meta(
-        "llama.attention.sliding_window",
+        kv("attention.sliding_window"),
         MetaValue::U32(config.sliding_window.unwrap_or(0) as u32),
     );
-    writer.set_meta("llama.expert_count", MetaValue::U32(0));
     // llama.cpp requires n_rot == n_embd / n_head for the llama arch, so this
     // must be the full per-head dimension (NOT half of it).
-    writer.set_meta("llama.rope.dimension_count", u(config.head_dim));
+    writer.set_meta(kv("rope.dimension_count"), u(config.head_dim));
 }
 
+/// GGUF token type for padding placeholders (`TokenType::UNUSED`).
+const TOKEN_TYPE_UNUSED: u32 = 5;
+
 /// Write GGUF `tokenizer.ggml.*` metadata from a tokenizer.
+///
+/// Two conventions must be honored for llama.cpp to load the file:
+///
+/// - Vocabulary coverage: HF tokenizers often define fewer ids than
+///   `config.vocab_size` reserves in the embedding matrix (Qwen2.5: 151,665
+///   tokenizer ids vs 151,936 rows). llama.cpp sizes the model from the
+///   `tokenizer.ggml.*` arrays rather than from `llama.vocab_size`, so a short
+///   token array makes it expect an embedding of `[d_model, n_tokens]` and
+///   reject the real `token_embd.weight` tensor with a "wrong shape" error.
+///   The vocabulary is padded up to `vocab_size` with `[PADn]` UNUSED
+///   placeholders — the same convention (numbered from 1) as llama.cpp's own
+///   HF converter.
+/// - Tokenizer family: vocabs with `<0xNN>` byte-fallback tokens follow the
+///   SentencePiece layout and are exported as `tokenizer.ggml.model "llama"`
+///   with a BOS token; GPT-2-style byte-level BPE vocabs (Qwen2.5, SmolLM...)
+///   have none, so exporting them as `"llama"` makes llama.cpp's SPM loader
+///   abort while looking up byte tokens. They are exported as `"gpt2"` with
+///   their merge rules instead — matching llama.cpp's Qwen converter.
 pub fn add_tokenizer_metadata(
     writer: &mut GgufWriter,
     tokenizer: &TokenizerStore,
-    model_name: &str,
+    vocab_size: usize,
+    pre: Option<&str>,
 ) {
-    let vocab = tokenizer.vocab_ordered();
-    let tokens: Vec<MetaValue> = vocab
-        .iter()
-        .map(|(t, _)| MetaValue::String(t.clone()))
-        .collect();
-    let scores: Vec<MetaValue> = vocab.iter().map(|_| MetaValue::F32(0.0)).collect();
-    let token_types: Vec<MetaValue> = tokenizer
-        .token_types()
-        .into_iter()
-        .map(MetaValue::U32)
-        .collect();
+    let spm_style = tokenizer.has_byte_fallback();
+    let ggml_model = if spm_style { "llama" } else { "gpt2" };
 
+    let mut pieces = vec![String::new(); vocab_size];
+    let scores = vec![MetaValue::F32(0.0); vocab_size];
+    let mut types = vec![TOKEN_TYPE_UNUSED; vocab_size];
+    let mut defined = vec![false; vocab_size];
+
+    let vocab = tokenizer.vocab_ordered();
+    let token_types = tokenizer.token_types();
+    for ((token, id), token_type) in vocab.into_iter().zip(token_types) {
+        if (id as usize) < vocab_size {
+            pieces[id as usize] = token;
+            types[id as usize] = token_type;
+            defined[id as usize] = true;
+        } else {
+            log::warn!(
+                "tokenizer id {id} is outside the model vocab_size {vocab_size}; dropping it"
+            );
+        }
+    }
+    // Pad placeholders numbered from 1, matching llama.cpp's converter so the
+    // token-array checksum can still match its known-vocabulary tables.
+    if defined.iter().filter(|slot| !**slot).count() > 0 {
+        let mut pad_n = 0usize;
+        for (id, slot) in defined.iter_mut().enumerate() {
+            if !*slot {
+                pad_n += 1;
+                pieces[id] = format!("[PAD{pad_n}]");
+            }
+        }
+        log::info!(
+            "padded {} vocabulary slots up to vocab_size {} with [PADn] UNUSED tokens",
+            pad_n,
+            vocab_size
+        );
+    }
+
+    writer.set_meta("tokenizer.ggml.model", MetaValue::String(ggml_model.into()));
+    if let Some(pre) = pre {
+        writer.set_meta("tokenizer.ggml.pre", MetaValue::String(pre.into()));
+    }
     writer.set_meta(
-        "tokenizer.ggml.model",
-        MetaValue::String(model_name.to_string()),
+        "tokenizer.ggml.tokens",
+        MetaValue::Array(pieces.into_iter().map(MetaValue::String).collect()),
     );
-    writer.set_meta("tokenizer.ggml.tokens", MetaValue::Array(tokens));
     writer.set_meta("tokenizer.ggml.scores", MetaValue::Array(scores));
-    writer.set_meta("tokenizer.ggml.token_type", MetaValue::Array(token_types));
-    writer.set_meta("tokenizer.ggml.bos_token_id", MetaValue::U32(1));
+    writer.set_meta(
+        "tokenizer.ggml.token_type",
+        MetaValue::Array(types.into_iter().map(MetaValue::U32).collect()),
+    );
+
+    // GPT-2-style BPE is merge-driven; without the rules llama.cpp cannot
+    // tokenize at all. SPM-style vocabs don't use merges.
+    if !spm_style {
+        let merges = tokenizer.merges();
+        if merges.is_empty() {
+            log::warn!(
+                "byte-level BPE tokenizer has no merge rules; llama.cpp will not be able to encode text"
+            );
+        } else {
+            writer.set_meta(
+                "tokenizer.ggml.merges",
+                MetaValue::Array(
+                    merges
+                        .iter()
+                        .cloned()
+                        .map(MetaValue::String)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+    }
+    // SentencePiece vocabs open with a fixed BOS token (`<s>` = 1). Byte-level
+    // BPE vocabs have no BOS concept — claiming one would prepend an arbitrary
+    // vocab entry to every prompt — so llama.cpp is told to add none.
+    if spm_style {
+        writer.set_meta("tokenizer.ggml.bos_token_id", MetaValue::U32(1));
+        writer.set_meta("tokenizer.ggml.add_bos_token", MetaValue::Bool(true));
+    } else {
+        writer.set_meta("tokenizer.ggml.add_bos_token", MetaValue::Bool(false));
+    }
     writer.set_meta(
         "tokenizer.ggml.eos_token_id",
         MetaValue::U32(tokenizer.eos_id),
@@ -280,7 +392,6 @@ pub fn add_tokenizer_metadata(
         "tokenizer.ggml.pad_token_id",
         MetaValue::U32(tokenizer.pad_id),
     );
-    writer.set_meta("tokenizer.ggml.add_bos_token", MetaValue::Bool(true));
     writer.set_meta("tokenizer.ggml.add_eos_token", MetaValue::Bool(false));
 
     // The Jinja chat template lets llama-cli / the llama server apply the
@@ -334,6 +445,14 @@ mod tests {
         assert_eq!(
             gguf_tensor_name("model.layers.1.self_attn.o_proj.weight"),
             Some("blk.1.attn_output.weight".to_string())
+        );
+        assert_eq!(
+            gguf_tensor_name("model.layers.2.self_attn.v_proj.bias"),
+            Some("blk.2.attn_v.bias".to_string())
+        );
+        assert_eq!(
+            gguf_tensor_name("model.layers.0.self_attn.o_proj.bias"),
+            None
         );
         assert_eq!(
             gguf_tensor_name("model.layers.0.mlp.up_proj.weight"),
@@ -554,6 +673,359 @@ mod tests {
             let expected = transpose(&burn_floats, d0, d1);
             let (got, _) = file.dequant_f32("blk.0.attn_v.weight").unwrap();
             assert_eq!(got, expected);
+        }
+    }
+
+    /// Regression test: Qwen-style tokenizers define fewer ids than
+    /// `config.vocab_size` reserves (Qwen2.5: 151,665 ids vs 151,936 rows).
+    /// llama.cpp sizes tensors from the GGUF `tokenizer.ggml.*` arrays, so the
+    /// short array made it expect an `[d_model, 151665]` embedding and reject
+    /// the exported `token_embd.weight` with a shape mismatch. The exporter
+    /// must pad the vocabulary up to `vocab_size`.
+    #[test]
+    fn pads_short_tokenizer_vocab_to_model_vocab_size() {
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::tiny();
+        let short_config = LlmModelConfig {
+            vocab_size: config.vocab_size / 2,
+            ..config.clone()
+        };
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+        let tokenizer = dummy_tokenizer(&short_config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("padded.gguf");
+        export_gguf(&model, &config, &tokenizer, &path, "test").unwrap();
+
+        let file = GgufFile::from_path(&path).unwrap();
+        let tokens = match &file.metadata["tokenizer.ggml.tokens"] {
+            MetaValue::Array(v) => v,
+            other => panic!("unexpected tokens metadata: {other:?}"),
+        };
+        let types = match &file.metadata["tokenizer.ggml.token_type"] {
+            MetaValue::Array(v) => v,
+            other => panic!("unexpected token_type metadata: {other:?}"),
+        };
+
+        // Arrays cover the full embedding vocab, not just the tokenizer's.
+        assert_eq!(tokens.len(), config.vocab_size);
+        assert_eq!(types.len(), config.vocab_size);
+
+        // Real ids keep their slots; padding fills only the undefined tail.
+        let last_defined = short_config.vocab_size - 1;
+        assert!(
+            matches!(&tokens[last_defined], MetaValue::String(s) if *s == format!("tok{last_defined}")),
+            "defined token was displaced: {:?}",
+            tokens[last_defined]
+        );
+        for (n, id) in [
+            (1usize, config.vocab_size / 2),
+            (
+                config.vocab_size - short_config.vocab_size,
+                config.vocab_size - 1,
+            ),
+        ] {
+            assert!(
+                matches!(tokens[id], MetaValue::String(ref s) if *s == format!("[PAD{n}]")),
+                "expected [PAD{n}] placeholder at id {id}, got {:?}",
+                tokens[id]
+            );
+            assert!(matches!(types[id], MetaValue::U32(TOKEN_TYPE_UNUSED)));
+        }
+
+        // Metadata still declares the embedding row count.
+        assert!(matches!(
+            file.metadata["llama.vocab_size"],
+            MetaValue::U32(n) if n == config.vocab_size as u32
+        ));
+
+        // No byte-fallback tokens -> GPT-2-style BPE family.
+        assert!(
+            matches!(&file.metadata["tokenizer.ggml.model"], MetaValue::String(s) if s == "gpt2")
+        );
+    }
+
+    /// Tied-embedding models (Qwen2.5, Gemma) have no `lm_head` parameter, so
+    /// without special handling no `output.weight` reaches the GGUF. llama.cpp
+    /// then falls back to using `token_embd` as the output projection — which
+    /// produces garbage output. The exporter must duplicate the embedding
+    /// matrix into an explicit `output.weight` tensor.
+    #[test]
+    fn tied_embeddings_export_output_weight() {
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig {
+            tie_word_embeddings: true,
+            ..LlmModelConfig::tiny()
+        };
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+        // No lm_head parameter exists in a tied model.
+        assert!(
+            !model
+                .collect(None, None, false)
+                .iter()
+                .any(|s| s.full_path() == "lm_head.weight")
+        );
+        let tokenizer = dummy_tokenizer(&config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tied.gguf");
+        export_gguf(&model, &config, &tokenizer, &path, "test").unwrap();
+        let file = GgufFile::from_path(&path).unwrap();
+
+        assert!(file.tensors.contains_key("token_embd.weight"));
+        assert!(file.tensors.contains_key("output.weight"));
+        assert_eq!(
+            file.tensors["output.weight"].shape,
+            vec![config.d_model, config.vocab_size]
+        );
+        assert_eq!(
+            file.tensors["output.weight"].dtype,
+            file.tensors["token_embd.weight"].dtype
+        );
+
+        // The output projection must be a copy of the embedding matrix.
+        let (embd, _) = file.dequant_f32("token_embd.weight").unwrap();
+        let (out, _) = file.dequant_f32("output.weight").unwrap();
+        assert_eq!(embd.len(), out.len());
+        for (i, (a, b)) in embd.iter().zip(out.iter()).enumerate() {
+            assert_eq!(a, b, "output.weight differs from token_embd at {i}");
+        }
+    }
+
+    /// Qwen2-style checkpoints train non-zero attention QKV biases. They must
+    /// survive the GGUF export as `blk.N.attn_{q,k,v}.bias` (F32, no
+    /// transpose) — dropping them silently turns every loaded model into
+    /// gibberish.
+    #[test]
+    fn exports_attention_biases() {
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig {
+            qkv_bias: true,
+            ..LlmModelConfig::tiny()
+        };
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+        let tokenizer = dummy_tokenizer(&config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bias.gguf");
+        export_gguf(&model, &config, &tokenizer, &path, "test").unwrap();
+        let file = GgufFile::from_path(&path).unwrap();
+
+        for proj in ["attn_q", "attn_k", "attn_v"] {
+            let name = format!("blk.0.{proj}.bias");
+            assert!(file.tensors.contains_key(&name), "missing `{name}`");
+            assert_eq!(file.tensors[&name].dtype, rlx_gguf::GgmlType::F32);
+            // Declared fastest-first as a plain [out] vector.
+            assert_eq!(file.tensors[&name].shape.len(), 1);
+        }
+        assert!(!file.tensors.contains_key("blk.0.attn_output.bias"));
+
+        // Values must match the burn parameters exactly (F32 path).
+        let snapshots = model.collect(None, None, false);
+        let snapshot = snapshots
+            .iter()
+            .find(|s| s.full_path() == "model.layers.0.self_attn.q_proj.bias")
+            .unwrap();
+        let floats = snapshot.to_data().unwrap().to_vec::<f32>().unwrap();
+        let (got, _) = file.dequant_f32("blk.0.attn_q.bias").unwrap();
+        assert_eq!(got.len(), floats.len());
+        for (i, (g, e)) in got.iter().zip(floats.iter()).enumerate() {
+            assert_eq!(g, e, "q bias mismatch at flat index {i}");
+        }
+    }
+
+    /// Vocabs containing `<0xNN>` byte-fallback tokens follow SentencePiece
+    /// conventions and must export as `tokenizer.ggml.model = "llama"` with a
+    /// BOS token; exporting them as `"gpt2"` would make llama.cpp's BPE loader
+    /// fail on the missing merge rules, and vice versa a true byte-level BPE
+    /// vocab exported as `"llama"` aborts llama.cpp's SPM loader while
+    /// resolving byte tokens (`unordered_map::at`).
+    #[test]
+    fn picks_gguf_tokenizer_family_from_byte_fallback() {
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::tiny();
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+
+        let export = |tokenizer: &crate::data::TokenizerStore, dir: &tempfile::TempDir| {
+            let path = dir.path().join("family.gguf");
+            export_gguf(&model, &config, tokenizer, &path, "test").unwrap();
+            GgufFile::from_path(&path).unwrap()
+        };
+
+        // SentencePiece-style: every slot is a byte-fallback token.
+        let spm_dir = tempfile::tempdir().unwrap();
+        let spm_path = spm_dir.path().join("tok.json");
+        let vocab: Vec<String> = (0..config.vocab_size)
+            .map(|i| format!("\"<0x{i:02X}>\": {i}"))
+            .collect();
+        std::fs::write(
+            &spm_path,
+            format!(
+                r#"{{"version":"1.0","added_tokens":[],"normalizer":null,
+                "pre_tokenizer":null,"post_processor":null,"decoder":null,
+                "model":{{"type":"WordLevel","vocab":{{{}}},"unk_id":0,"unk_token":"<0x00>"}}}}"#,
+                vocab.join(",")
+            ),
+        )
+        .unwrap();
+        let spm_file = export(
+            &crate::data::TokenizerStore::from_file(&spm_path).unwrap(),
+            &spm_dir,
+        );
+        assert!(
+            matches!(&spm_file.metadata["tokenizer.ggml.model"], MetaValue::String(s) if s == "llama")
+        );
+        assert!(matches!(
+            spm_file.metadata["tokenizer.ggml.bos_token_id"],
+            MetaValue::U32(1)
+        ));
+
+        // Byte-level BPE-style: no byte-fallback tokens anywhere.
+        let bpe_dir = tempfile::tempdir().unwrap();
+        let bpe_file = export(&dummy_tokenizer(&config).unwrap(), &bpe_dir);
+        assert!(
+            matches!(&bpe_file.metadata["tokenizer.ggml.model"], MetaValue::String(s) if s == "gpt2")
+        );
+        assert!(
+            !bpe_file
+                .metadata
+                .contains_key("tokenizer.ggml.bos_token_id")
+        );
+        assert!(matches!(
+            bpe_file.metadata["tokenizer.ggml.add_bos_token"],
+            MetaValue::Bool(false)
+        ));
+    }
+
+    /// The Qwen2 family must map to a QKV-biased model even when config.json
+    /// omits `attention_bias` (HF's default for that architecture).
+    #[test]
+    fn qwen_config_enables_attention_bias_by_default() {
+        use crate::config::TransformersConfig;
+        use crate::model::LlmModelConfig;
+
+        let qwen = LlmModelConfig::from_transformers(
+            &TransformersConfig::from_value(&serde_json::json!({
+                "model_type": "qwen2",
+                "hidden_size": 896,
+                "intermediate_size": 4864,
+                "num_attention_heads": 14,
+                "num_hidden_layers": 24,
+                "vocab_size": 151936,
+                "max_position_embeddings": 32768,
+            }))
+            .unwrap(),
+        );
+        assert!(qwen.qkv_bias);
+
+        // Explicit false must be honored (and non-Qwen stays bias-free).
+        let tiny = LlmModelConfig::from_transformers(
+            &TransformersConfig::from_value(&serde_json::json!({
+                "model_type": "llama",
+                "hidden_size": 576,
+                "intermediate_size": 1536,
+                "num_attention_heads": 12,
+                "num_hidden_layers": 4,
+                "vocab_size": 32000,
+                "max_position_embeddings": 2048,
+            }))
+            .unwrap(),
+        );
+        assert!(!tiny.qkv_bias);
+    }
+
+    /// Qwen2 models must export under the `qwen2` GGUF architecture with
+    /// `qwen2.`-prefixed metadata, a `tokenizer.ggml.pre` of `qwen2`, and —
+    /// critically — UNPERMUTED Q/K weights: this build of llama.cpp applies
+    /// NEOX-style RoPE directly to HF-layout weights for that architecture.
+    /// Exporting as `llama` (with permutation) loads fine but generates
+    /// garbage output.
+    #[test]
+    fn qwen2_exports_own_architecture_without_rope_permute() {
+        use crate::config::TransformersConfig;
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::from_transformers(
+            &TransformersConfig::from_value(&serde_json::json!({
+                "model_type": "qwen2",
+                "hidden_size": 64,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 2,
+                "vocab_size": 256,
+                "max_position_embeddings": 64,
+                "tie_word_embeddings": false,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(config.gguf_architecture(), "qwen2");
+        assert!(config.qkv_bias);
+
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+        let tokenizer = dummy_tokenizer(&config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qwen.gguf");
+        export_gguf(&model, &config, &tokenizer, &path, "test").unwrap();
+        let file = GgufFile::from_path(&path).unwrap();
+
+        // Architecture + prefixed metadata keys.
+        assert!(
+            matches!(&file.metadata["general.architecture"], MetaValue::String(s) if s == "qwen2")
+        );
+        for key in [
+            "qwen2.context_length",
+            "qwen2.embedding_length",
+            "qwen2.block_count",
+            "qwen2.vocab_size",
+            "qwen2.rope.dimension_count",
+        ] {
+            assert!(file.metadata.contains_key(key), "missing `{key}`");
+        }
+        assert!(!file.metadata.contains_key("llama.vocab_size"));
+
+        // Tokenizer pre.
+        assert!(
+            matches!(&file.metadata["tokenizer.ggml.pre"], MetaValue::String(s) if s == "qwen2")
+        );
+
+        // Q/K must be plain transposes (no rope row permutation): rebuild the
+        // expected PyTorch-layout matrix from the burn snapshot.
+        let snapshots = model.collect(None, None, false);
+        for hf_name in [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+        ] {
+            let s = snapshots.iter().find(|s| s.full_path() == hf_name).unwrap();
+            let [d0, d1] = s.shape.dims::<2>();
+            let floats = s.to_data().unwrap().to_vec::<f32>().unwrap();
+            let expected = transpose(&floats, d0, d1);
+            let gguf_name = gguf_tensor_name(hf_name).unwrap();
+            let (got, _) = file.dequant_f32(&gguf_name).unwrap();
+            assert_eq!(got.len(), expected.len());
+            for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(g, e, "{gguf_name} must be an unpermuted transpose at {i}");
+            }
         }
     }
 

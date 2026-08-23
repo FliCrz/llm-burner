@@ -233,11 +233,18 @@ fn mean_last_hidden<B: Backend>(
         bail!("all probes tokenized to zero tokens");
     }
 
-    let flat = sum.div_scalar(count as f32).into_data().to_vec::<f32>();
-    Ok((
-        flat.context("unexpected tensor layout reading hidden means")?,
-        count,
-    ))
+    // The model may run in bf16/f16 on GPU; read the mean back dtype-agnostically.
+    let data = sum.div_scalar(count as f32).into_data();
+    let flat: Vec<f32> = if data.dtype == burn::tensor::DType::F32 {
+        data.to_vec()
+            .context("unexpected tensor layout reading hidden means")?
+    } else {
+        let converted = data.convert_dtype(burn::tensor::DType::F32);
+        converted
+            .to_vec()
+            .context("unexpected tensor layout reading hidden means")?
+    };
+    Ok((flat, count))
 }
 
 /// Compute the unit refusal direction from already-tokenized probe sets.

@@ -1,24 +1,28 @@
 //! Fine-tuning driver.
-//
+//!
 //! Runs a hand-written training loop over a fixed number of optimization
 //! steps, using burn's public [`Learner`] so the model/optimizer/scheduler
 //! plumbing stays idiomatic, while the step count is exact.
-
+//!
 //! # Precision Support
 //!
-//! Safetensors checkpoints can be emitted in three floating-point dtypes:
-//! - `F32`: Full 32-bit floating point (default).
-//! - `BF16`: 16-bit bfloat16 (same dynamic range as F32, 50% memory reduction).
-//! - `F16`: 16-bit floating point (smaller dynamic range).
+//! [`Precision`] selects the dtype used for weights *and* training math:
+//! - `F32`: full 32-bit floats (default; most stable).
+//! - `BF16`: bfloat16 — same exponent range as F32, 50% memory reduction.
+//! - `F16`: IEEE half — smaller dynamic range.
 //!
-//! Training always runs with f32 math, regardless of export precision.
+//! The whole pipeline (checkpoint load, forward/backward, optimizer state,
+//! export) runs in the selected dtype on the compiled backend. F32 remains the
+//! default because pure half-precision AdamW can be numerically fragile.
 
 /// The weight-backed inference/export backend.
 ///
 /// With the default `gpu` feature this is Burn's fused wgpu backend (Vulkan
-/// on Linux/Windows, Metal on macOS); the device is chosen automatically,
-/// preferring high-power GPUs. Without it (`--no-default-features
-/// --features flex`) training and inference run on the pure-Rust CPU backend.
+/// on Linux/Windows, Metal on macOS) running in f32; half-precision training
+/// instantiates the same backend with bf16/f16 element types at the dispatch
+/// site in [`crate::pipeline::run_pipeline`]. Without the gpu feature
+/// (`--no-default-features --features flex`) everything runs on the pure-Rust
+/// CPU backend, which computes in f32 only.
 #[cfg(feature = "gpu")]
 pub type InferBackend = burn::backend::Wgpu<f32, i32>;
 #[cfg(not(feature = "gpu"))]
@@ -45,6 +49,8 @@ pub fn backend_label() -> &'static str {
     }
 }
 
+use std::path::PathBuf;
+
 use crate::model::{CausalLmBatch, LlmModel, LlmModelConfig};
 use crate::ui::Dashboard;
 
@@ -52,9 +58,17 @@ use burn::module::{AutodiffModule, Module};
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamW, AdamWConfig, GradientsParams};
 use burn::tensor::DType;
+use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::train::{Learner, LearningComponentsMarker};
 
 /// Precision modes supported for training and model weights.
+///
+/// On GPU builds the requested dtype drives the whole stack (checkpoint load,
+/// forward/backward math, optimizer state, export). If the GPU probe rejects
+/// the dtype (buggy driver), or on CPU-only builds, training computes in f32
+/// while the checkpoint load/export still honor the requested dtype — fp32
+/// master weights are also the numerically safer recipe for half-precision
+/// AdamW.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Precision {
     /// Full 32-bit floating point.
@@ -90,7 +104,8 @@ impl std::str::FromStr for Precision {
 }
 
 impl Precision {
-    /// Tensor dtype used when writing safetensors checkpoints.
+    /// Tensor dtype used for model weights (loading, compute, and exported
+    /// safetensors checkpoints).
     pub fn safetensors_dtype(self) -> DType {
         match self {
             Precision::F32 => DType::F32,
@@ -115,9 +130,15 @@ pub struct TrainConfig {
     pub weight_decay: f64,
     /// Report progress every `log_every` steps.
     pub log_every: usize,
-    /// Floating-point dtype for exported safetensors weights.
-    /// Training on the Flex backend still runs with F32 math.
+    /// Floating-point dtype for weights, training math, and safetensors export.
     pub precision: Precision,
+    /// Show the Ratatui progress dashboard while training. When disabled
+    /// (`--no-tui`), progress is reported through the log file only — useful
+    /// for tests and non-interactive runs.
+    pub tui: bool,
+    /// While the training dashboard owns the terminal, raw stdout/stderr are
+    /// redirected into this file so library output cannot garble the TUI.
+    pub output_redirect: Option<PathBuf>,
 }
 
 impl Default for TrainConfig {
@@ -130,37 +151,35 @@ impl Default for TrainConfig {
             weight_decay: 0.1,
             log_every: 10,
             precision: Precision::default(),
+            tui: true,
+            output_redirect: None,
         }
     }
 }
 
-/// Split token windows into `batch_size`-sized groups. The last partial batch
-/// is dropped so every batch is full and the step count stays exact.
-pub fn partition_windows(windows: &[Vec<u32>], batch_size: usize) -> Vec<Vec<Vec<u32>>> {
-    windows
-        .chunks(batch_size)
-        .filter(|chunk| chunk.len() == batch_size)
-        .map(|chunk| chunk.to_vec())
-        .collect()
-}
-
-fn build_batch<B: burn::tensor::backend::Backend>(
-    windows: &[Vec<u32>],
+/// Build a causal-LM batch from a contiguous slice of consecutive windows.
+fn build_batch<B: Backend>(
+    flat_tokens: &[u32],
+    seq_len: usize,
     pad_id: u32,
     device: &B::Device,
 ) -> CausalLmBatch<B> {
-    crate::data::build_causal_batch(windows, device, pad_id)
+    crate::data::build_causal_batch_from_flat(flat_tokens, seq_len, device, pad_id)
 }
 
-/// Train `model` for exactly `cfg.steps` steps over `windows`, reporting
-/// progress through the Ratatui [`Dashboard`]. Returns the trained model on
-/// the inner (non-autodiff) backend.
-pub fn train_model(
-    model: LlmModel<TrainBackend>,
-    windows: &[Vec<u32>],
+/// Train `model` for exactly `cfg.steps` steps over the token windows in
+/// `windows`, reporting progress through the Ratatui [`Dashboard`]. Returns
+/// the trained model on the inner (non-autodiff) backend.
+pub fn train_model<B>(
+    model: LlmModel<B>,
+    windows: &crate::data::WindowStore,
     pad_id: u32,
     cfg: &TrainConfig,
-) -> LlmModel<InferBackend> {
+) -> LlmModel<B::InnerBackend>
+where
+    B: AutodiffBackend,
+    B::FloatElem: Into<f32>,
+{
     assert!(
         windows.len() >= cfg.batch_size,
         "need at least `batch_size` ({}) windows, got {}",
@@ -174,91 +193,115 @@ pub fn train_model(
         .with_beta_1(0.9)
         .with_beta_2(0.95)
         .with_epsilon(1e-8)
-        .init::<TrainBackend, LlmModel<TrainBackend>>();
+        .init::<B, LlmModel<B>>();
     let lr_scheduler: burn::optim::LearningRate = cfg.lr;
 
     let mut learner = Learner::<
         LearningComponentsMarker<
-            TrainBackend,
+            B,
             burn::optim::LearningRate,
-            LlmModel<TrainBackend>,
-            OptimizerAdaptor<AdamW, LlmModel<TrainBackend>, TrainBackend>,
+            LlmModel<B>,
+            OptimizerAdaptor<AdamW, LlmModel<B>, B>,
         >,
     >::new(model, optimizer, lr_scheduler);
     learner.lr_step();
 
-    let batches = partition_windows(windows, cfg.batch_size);
-    let dashboard = Dashboard::start(cfg.steps);
+    // A trailing partial batch is dropped so the step count stays exact.
+    let batches = windows.batch_count(cfg.batch_size);
+    let dashboard = if cfg.tui {
+        Some(Dashboard::start_with_output_redirect(
+            cfg.steps,
+            cfg.output_redirect.as_deref(),
+        ))
+    } else {
+        None
+    };
     let mut last_loss = 0.0;
+    let mut step = 0usize;
 
-    for step in 1..=cfg.steps {
-        let batch_windows = &batches[(step - 1) % batches.len()];
-        let batch: CausalLmBatch<TrainBackend> = build_batch(batch_windows, pad_id, &device);
+    while step < cfg.steps {
+        let batch_index = step % batches.max(1);
+        let start_window = batch_index * cfg.batch_size;
+        let flat = windows.window_tokens(start_window, cfg.batch_size);
+
+        let batch = build_batch::<B>(flat, windows.seq_len(), pad_id, &device);
 
         let output = learner.train_step(batch);
-        let loss = output.item.loss.clone().into_scalar();
+        let loss: f32 = output.item.loss.clone().into_scalar().into();
         let gradients: GradientsParams = output.grads;
 
         learner.optimizer_step(gradients);
         learner.lr_step();
 
+        step += 1;
         last_loss = loss;
-        dashboard.update(step, loss);
+        if let Some(dashboard) = &dashboard {
+            dashboard.update(step, loss);
+        }
 
-        if cfg.log_every > 0 && step % cfg.log_every == 0 {
+        if cfg.log_every > 0 && step.is_multiple_of(cfg.log_every) {
             log::info!("step {}/{} loss={:.6} lr={}", step, cfg.steps, loss, cfg.lr);
         }
     }
 
-    dashboard.finish(cfg.steps, last_loss);
+    if let Some(dashboard) = dashboard {
+        dashboard.finish(cfg.steps, last_loss);
+    }
 
     let model = learner.model();
     model.valid()
 }
 
-/// Move a loaded inference (non-autodiff) model onto the training backend.
-pub fn to_train_backend(model: LlmModel<InferBackend>) -> LlmModel<TrainBackend> {
-    model.train::<TrainBackend>()
+/// Move an inference (non-autodiff) model onto the autodiff training backend.
+pub fn to_train_backend<B: Backend>(model: LlmModel<B>) -> LlmModel<burn::backend::Autodiff<B>> {
+    model.train()
 }
 
-/// Move a trained autodiff model back onto the inference backend.
-pub fn to_infer_backend(model: LlmModel<TrainBackend>) -> LlmModel<InferBackend> {
+/// Move a trained autodiff model back onto its inference backend.
+pub fn to_infer_backend<B: AutodiffBackend>(model: LlmModel<B>) -> LlmModel<B::InnerBackend> {
     model.valid()
 }
 
 /// Build a fresh model for the given config on the training backend.
-pub fn train_model_from_config(config: &LlmModelConfig) -> LlmModel<TrainBackend> {
+pub fn train_model_from_config<B: AutodiffBackend>(config: &LlmModelConfig) -> LlmModel<B> {
     let device = Default::default();
-    LlmModel::new(config, &device).train::<TrainBackend>()
+    LlmModel::new(config, &device).train::<B>()
 }
 
 #[cfg(test)]
 mod tests {
+    // Only the gpu-gated integration test needs the parent scope.
+    #[cfg(not(feature = "gpu"))]
     use super::*;
 
     #[test]
-    fn partition_keeps_full_batches_only() {
-        let windows: Vec<Vec<u32>> = (0..11).map(|i| vec![i as u32; 8]).collect();
-        let batches = partition_windows(&windows, 4);
-        assert_eq!(batches.len(), 2);
-        for batch in &batches {
-            assert_eq!(batch.len(), 4);
-        }
-    }
-
-    #[test]
-    fn empty_windows_yield_no_batches() {
-        assert!(partition_windows(&[], 4).is_empty());
+    fn window_store_drops_partial_batches() {
+        let mut store = crate::data::WindowStore::new(4);
+        store.extend_windows(&[1; 8]);
+        store.extend_windows(&[2; 4]);
+        store.push_padded_tail(&[3], 0);
+        // 4 complete windows: two full batches of 2, none for batch_size 8.
+        assert_eq!(store.len(), 4);
+        assert_eq!(store.total_tokens(), 16);
+        assert_eq!(store.batch_count(2), 2);
+        assert_eq!(store.batch_count(8), 0);
+        assert_eq!(store.window_tokens(2, 2), &[2, 2, 2, 2, 3, 0, 0, 0]);
     }
 
     #[test]
     #[cfg(not(feature = "gpu"))] // trains on the compiled TrainBackend (GPU under `gpu`)
     fn train_model_reduces_loss_on_toy_sequence() {
         let config = LlmModelConfig::tiny();
-        let model = train_model_from_config(&config);
+        let model = train_model_from_config::<TrainBackend>(&config);
 
         let sequence: Vec<u32> = (0..16).cycle().take(64).collect();
-        let windows: Vec<Vec<u32>> = sequence.chunks(8).map(|c| c.to_vec()).collect();
+
+        let mut windows = crate::data::WindowStore::new(8);
+        let chunked: Vec<Vec<u32>> = sequence.chunks(8).map(|c| c.to_vec()).collect();
+        for chunk in &chunked[..chunked.len() - 1] {
+            windows.extend_windows(chunk);
+        }
+        windows.push_padded_tail(chunked.last().unwrap(), 0);
 
         let cfg = TrainConfig {
             steps: 20,
@@ -268,10 +311,12 @@ mod tests {
             weight_decay: 0.0,
             log_every: 0,
             precision: Precision::F32,
+            tui: false,
+            output_redirect: None,
         };
 
         let device = Default::default();
-        let init_batch = build_batch::<InferBackend>(&windows[0..2], 0, &device);
+        let init_batch = build_batch::<InferBackend>(windows.window_tokens(0, 2), 8, 0, &device);
         let init_loss: f32 = model
             .valid()
             .forward_classification(init_batch)
@@ -280,7 +325,7 @@ mod tests {
 
         let trained = train_model(model, &windows, 0, &cfg);
 
-        let final_batch = build_batch::<InferBackend>(&windows[0..2], 0, &device);
+        let final_batch = build_batch::<InferBackend>(windows.window_tokens(0, 2), 8, 0, &device);
         let final_loss: f32 = trained
             .forward_classification(final_batch)
             .loss

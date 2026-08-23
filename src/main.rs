@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use llm_burner::data::HfDataset;
 use llm_burner::hf::HfRepo;
-use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir, run_pipeline};
+use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir};
 use llm_burner::train::{Precision, TrainConfig};
 
 /// A simplified Gemma-family LLM fine-tuner for Burn.
@@ -31,7 +31,7 @@ enum Command {
         dataset: String,
 
         /// Base output directory (`models/` and `datasets/` are created under it).
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = "artifacts")]
         out: PathBuf,
 
         /// Concurrent file downloads.
@@ -57,8 +57,9 @@ enum Command {
         #[arg(long)]
         dataset_dir: Option<PathBuf>,
 
-        /// Base output directory.
-        #[arg(long, default_value = ".")]
+        /// Base output directory (`models/` and `datasets/` are created under it;
+        /// fine-tuned weights land in `trained/`).
+        #[arg(long, default_value = "artifacts")]
         out: PathBuf,
 
         /// Exact number of optimization steps.
@@ -81,8 +82,13 @@ enum Command {
         #[arg(long, default_value_t = 0.1)]
         weight_decay: f64,
 
-        /// Safetensors weight precision for export: f32, bf16, or f16.
-        /// Training still runs with f32 math.
+        /// Disable the Ratatui progress dashboard (useful for testing and
+        /// non-interactive runs); progress goes to the log file instead.
+        #[arg(long)]
+        no_tui: bool,
+
+        /// Weight/compute precision: f32, bf16, or f16. Applies to checkpoint
+        /// loading, training math, optimizer state, and safetensors export.
         #[arg(long, default_value_t = Precision::F32)]
         precision: Precision,
 
@@ -115,6 +121,16 @@ enum Command {
         max_workers: usize,
     },
 
+    /// Validate that the GPU driver can compile and run kernels in a given
+    /// precision (exit 0) or die trying (any other exit). Used internally as
+    /// the child process of a pre-flight probe before half-precision runs.
+    #[command(hide = true)]
+    GpuProbe {
+        /// Precision to validate on the GPU backend.
+        #[arg(long)]
+        precision: Precision,
+    },
+
     /// Export a trained model to GGUF format.
     Export {
         /// Model directory containing config.json, tokenizer.json, and .safetensors.
@@ -122,7 +138,7 @@ enum Command {
         model_dir: PathBuf,
 
         /// Output path for the .gguf file.
-        #[arg(long, default_value = "model.gguf")]
+        #[arg(long, default_value = "artifacts/trained/model.gguf")]
         output: PathBuf,
 
         /// Model name string recorded in GGUF metadata.
@@ -132,8 +148,6 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let cli = Cli::parse();
     match cli.command {
         Command::Download {
@@ -142,6 +156,7 @@ fn main() -> anyhow::Result<()> {
             out,
             max_workers,
         } => {
+            init_stderr_logger();
             let repo = HfRepo::parse(&model)?;
             let ds = HfDataset::parse(&dataset)?;
 
@@ -187,6 +202,7 @@ fn main() -> anyhow::Result<()> {
             lr,
             weight_decay,
             max_workers,
+            no_tui,
             precision,
             ablate_refusal,
             refusal_layer,
@@ -194,10 +210,25 @@ fn main() -> anyhow::Result<()> {
             harmful_file,
             harmless_file,
         } => {
+            std::fs::create_dir_all(&out)
+                .with_context(|| format!("failed to create `{}`", out.display()))?;
+            let trained_dir = out.join("trained");
+            let log_path = out.join("train.log");
+let _ = std::fs::remove_file(&log_path);
+let log_file = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&log_path)
+    .with_context(|| format!("failed to create `{}`", log_path.display()))?;
+env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    .target(env_logger::Target::Pipe(Box::new(log_file)))
+    .init();
+            println!("logging to `{}`", log_path.display());
+
             let (mdir, ddir) =
                 resolve_inputs(&out, model, model_dir, dataset, dataset_dir, max_workers)?;
 
-            for path in [&mdir, &ddir, &out] {
+            for path in [&mdir, &ddir] {
                 if !path.exists() {
                     anyhow::bail!("path does not exist: `{}`", path.display());
                 }
@@ -208,12 +239,11 @@ fn main() -> anyhow::Result<()> {
             }
 
             log::info!("training precision: {:?}", precision);
-            log::info!("backend: {}", llm_burner::train::backend_label());
 
             let inputs = PipelineInputs {
                 model_dir: mdir,
                 dataset_dir: ddir,
-                out_dir: out,
+                out_dir: trained_dir,
                 train: TrainConfig {
                     steps,
                     batch_size,
@@ -222,6 +252,8 @@ fn main() -> anyhow::Result<()> {
                     weight_decay,
                     log_every: (steps / 20).max(1),
                     precision,
+                    tui: !no_tui,
+                    output_redirect: Some(log_path.clone()),
                 },
                 ablation: ablate_refusal.then_some(llm_burner::model::ablation::AblationConfig {
                     direction_layer: refusal_layer,
@@ -229,15 +261,54 @@ fn main() -> anyhow::Result<()> {
                     harmful_file,
                     harmless_file,
                 }),
-                model_name: "llm-burner-finetune".to_string(),
             };
-            run_pipeline(&inputs)?;
+
+            // Pre-flight: half-precision kernels can segfault buggy GPU
+            // drivers (Mesa RADV on some AMD iGPUs), which is unrecoverable
+            // in-process. Validate the requested dtype in a throwaway child
+            // and fall back to CPU training when it does not come back clean.
+            #[cfg(feature = "gpu")]
+            let gpu_ok = {
+                use llm_burner::probe::{ProbeOutcome, spawn_probe};
+                let exe = std::env::current_exe()
+                    .context("cannot locate own executable for the GPU probe")?;
+                match spawn_probe(&exe, precision, llm_burner::probe::PROBE_TIMEOUT) {
+                    ProbeOutcome::Success => true,
+                    outcome => {
+                        log::warn!(
+                            "GPU probe for {precision} did not succeed: {outcome}; \
+                             falling back to the CPU backend (f32 compute, \
+                             {precision} checkpoint load/export)"
+                        );
+                        false
+                    }
+                }
+            };
+            #[cfg(feature = "gpu")]
+            if gpu_ok {
+                log::info!("backend: {}", llm_burner::train::backend_label());
+                llm_burner::pipeline::run_pipeline(&inputs)?;
+            } else {
+                llm_burner::pipeline::run_pipeline_on_cpu(&inputs)?;
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                log::info!("backend: {}", llm_burner::train::backend_label());
+                llm_burner::pipeline::run_pipeline_on_cpu(&inputs)?;
+            }
+
+            println!("outputs in `{}`", inputs.out_dir.display());
+        }
+        Command::GpuProbe { precision } => {
+            init_stderr_logger();
+            llm_burner::probe::run_gpu_probe(precision)?;
         }
         Command::Export {
             model_dir,
             output,
             model_name,
         } => {
+            init_stderr_logger();
             // Load config from the model directory
             let config_path = model_dir.join("config.json");
             if !config_path.exists() {
@@ -269,7 +340,11 @@ fn main() -> anyhow::Result<()> {
                 &config,
                 &Default::default(),
             );
-            llm_burner::model::load::load_from_safetensors(&mut model, &shards_refs)?;
+            llm_burner::model::load::load_from_safetensors(
+                &mut model,
+                &shards_refs,
+                burn::tensor::DType::F32,
+            )?;
 
             // Export to GGUF
             let gguf_parent = output.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -336,4 +411,9 @@ fn resolve_inputs(
     };
 
     Ok((resolved_model, resolved_dataset))
+}
+
+/// Log to the terminal for commands that do not own it with a TUI.
+fn init_stderr_logger() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 }

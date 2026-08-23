@@ -51,6 +51,7 @@ impl<B: Backend> CausalAttention<B> {
         rope_theta: f64,
         sliding_window: Option<usize>,
         has_qk_norm: bool,
+        qkv_bias: bool,
         rms_eps: f64,
         device: &B::Device,
     ) -> Self {
@@ -58,21 +59,33 @@ impl<B: Backend> CausalAttention<B> {
             mean: 0.0,
             std: 0.02,
         };
-        let q_proj = LinearConfig::new(hidden_size, n_heads * head_dim)
-            .with_bias(false)
+        // Only the Q/K/V projections take a bias (and only for some
+        // architectures, e.g. Qwen2); the output projection never does.
+        // Biases are zero-initialized, matching Hugging Face.
+        let mut q_proj = LinearConfig::new(hidden_size, n_heads * head_dim)
+            .with_bias(qkv_bias)
             .with_initializer(initializer.clone())
             .init(device);
-        let k_proj = LinearConfig::new(hidden_size, n_kv_heads * head_dim)
-            .with_bias(false)
+        let mut k_proj = LinearConfig::new(hidden_size, n_kv_heads * head_dim)
+            .with_bias(qkv_bias)
             .with_initializer(initializer.clone())
             .init(device);
-        let v_proj = LinearConfig::new(hidden_size, n_kv_heads * head_dim)
-            .with_bias(false)
+        let mut v_proj = LinearConfig::new(hidden_size, n_kv_heads * head_dim)
+            .with_bias(qkv_bias)
             .with_initializer(initializer.clone())
             .init(device);
+        if qkv_bias {
+            for proj in [&mut q_proj, &mut k_proj, &mut v_proj] {
+                let out_dim = proj.bias.as_ref().unwrap().val().dims()[0];
+                let zeros = Tensor::<B, 1>::zeros([out_dim], device);
+                if let Some(p) = proj.bias.take() {
+                    proj.bias = Some(p.map(|_| zeros));
+                }
+            }
+        }
         let o_proj = LinearConfig::new(n_heads * head_dim, hidden_size)
             .with_bias(false)
-            .with_initializer(initializer.clone())
+            .with_initializer(initializer)
             .init(device);
 
         let q_norm = if has_qk_norm {
@@ -138,8 +151,17 @@ impl<B: Backend> CausalAttention<B> {
 
         let scale = (self.head_dim as f64).sqrt();
         let num_groups = self.n_heads / self.n_kv_heads;
-        let k = k.repeat_dim(1, num_groups);
-        let v = v.repeat_dim(1, num_groups);
+        // Expand each KV head to its contiguous group of query heads
+        // (HF `repeat_kv`: head h uses kv head h / num_groups). A plain
+        // `repeat_dim(1, …)` would interleave heads instead of repeating
+        // them block-wise, silently mispairing queries and keys.
+        let expand = |t: Tensor<B, 4>| -> Tensor<B, 4> {
+            let t = t.reshape([batch, self.n_kv_heads, 1, seq, self.head_dim]);
+            t.repeat_dim(2, num_groups)
+                .reshape([batch, self.n_heads, seq, self.head_dim])
+        };
+        let k = expand(k);
+        let v = expand(v);
 
         let scores = (q / scale).matmul(k.transpose());
 

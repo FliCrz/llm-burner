@@ -21,12 +21,31 @@ pub struct CausalLmBatch<B: burn::tensor::backend::Backend> {
     pub input: Tensor<B, 2, Int>,
     /// Target token ids (next token), shape `[batch, seq]`.
     pub target: Tensor<B, 2, Int>,
+    /// Target value that marks padding; excluded from the loss when set.
+    ///
+    /// Window tails are padded and every row's final target is forced to this
+    /// value, so without masking those positions would teach the model to
+    /// emit padding.
+    pub pad_id: Option<u32>,
 }
 
 impl<B: burn::tensor::backend::Backend> CausalLmBatch<B> {
-    /// Create a new batch.
+    /// Create a new unmasked batch.
     pub fn new(input: Tensor<B, 2, Int>, target: Tensor<B, 2, Int>) -> Self {
-        Self { input, target }
+        Self {
+            input,
+            target,
+            pad_id: None,
+        }
+    }
+
+    /// Create a batch whose `pad_id` targets are ignored by the loss.
+    pub fn new_masked(input: Tensor<B, 2, Int>, target: Tensor<B, 2, Int>, pad_id: u32) -> Self {
+        Self {
+            input,
+            target,
+            pad_id: Some(pad_id),
+        }
     }
 }
 
@@ -75,14 +94,37 @@ impl<B: burn::tensor::backend::Backend> ItemLazy for CausalLmOutput<B> {
 
 impl<B: burn::tensor::backend::Backend> LlmModel<B> {
     /// Compute the cross-entropy loss and logits for a batch.
+    ///
+    /// Positions whose target equals the batch's `pad_id` are excluded from
+    /// the mean, so padding never enters the gradient. (burn's own pad-token
+    /// handling zeroes excluded positions but still divides by the full
+    /// position count, which would dilute the loss whenever a window tail is
+    /// padded — hence the manual renormalization.)
     pub fn forward_classification(&self, batch: CausalLmBatch<B>) -> CausalLmOutput<B> {
         let logits = self.forward(batch.input);
         let [batch_size, seq_len, vocab_size] = logits.dims();
         let logits_flat = logits.clone().reshape([batch_size * seq_len, vocab_size]);
         let targets_flat = batch.target.clone().reshape([batch_size * seq_len]);
 
-        let loss =
-            CrossEntropyLoss::new(None, &logits_flat.device()).forward(logits_flat, targets_flat);
+        let loss = CrossEntropyLoss::new(batch.pad_id.map(|p| p as usize), &logits_flat.device())
+            .forward(logits_flat, targets_flat.clone());
+
+        if let Some(pad) = batch.pad_id {
+            // Renormalize: burn divided by all positions, we want the mean
+            // over retained (non-pad) targets only.
+            let positions = (batch_size * seq_len) as f32;
+            let device = &logits.device();
+            let total = Tensor::<B, 1>::from_floats([positions], device);
+            let kept = targets_flat
+                .not_equal_elem(pad as i64)
+                .int()
+                .sum()
+                .float()
+                .clamp_min(1.0)
+                .reshape([1]);
+            let loss = loss.mul(total).div(kept);
+            return CausalLmOutput::new(loss, logits, batch.target);
+        }
 
         CausalLmOutput::new(loss, logits, batch.target)
     }
@@ -158,5 +200,48 @@ mod tests {
         assert_eq!(output.logits.dims(), [1, 4, config.vocab_size]);
         assert_eq!(output.loss.dims(), [1]);
         assert_eq!(output.targets.dims(), [1, 4]);
+    }
+
+    /// Masked batches must average cross-entropy over the non-pad targets
+    /// only: padding must not leak into training gradients.
+    #[test]
+    fn loss_ignores_pad_targets() {
+        type B = burn::backend::Flex<f32, i32>;
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::tiny();
+        let model = LlmModel::<B>::new(&config, &device);
+
+        let pad = 0u32;
+        let input = Tensor::<B, 2, Int>::from_data([[1, 5, 9, 12]], &device);
+        let target = Tensor::<B, 2, Int>::from_data([[5, 9, 12, pad]], &device);
+        let masked = model.forward_classification(CausalLmBatch::new_masked(
+            input.clone(),
+            target.clone(),
+            pad,
+        ));
+        let full = model.forward_classification(CausalLmBatch::new(input, target));
+
+        // Reference: plain CE over the three leading (non-pad) positions.
+        let [_, _, vocab] = masked.logits.dims();
+        let logits3 = masked
+            .logits
+            .clone()
+            .slice([0..1, 0..3])
+            .reshape([3, vocab]);
+        let targets3 = masked.targets.slice([0..1, 0..3]).reshape([3]);
+        let reference = CrossEntropyLoss::new(None, &device).forward(logits3, targets3);
+
+        let masked_loss: f32 = masked.loss.into_scalar();
+        let reference_loss: f32 = reference.into_scalar();
+        let full_loss: f32 = full.loss.into_scalar();
+
+        assert!(
+            (masked_loss - reference_loss).abs() < 1e-4,
+            "masked loss {masked_loss} != non-pad-only reference {reference_loss}"
+        );
+        assert!(
+            (full_loss - masked_loss).abs() > 1e-4,
+            "pad position should change the unmasked loss"
+        );
     }
 }

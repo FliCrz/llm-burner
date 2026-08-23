@@ -33,6 +33,16 @@ pub struct LlmModelConfig {
     pub rms_eps: f64,
     /// Share the input embedding matrix with the output projection.
     pub tie_word_embeddings: bool,
+    /// Give the query/key/value projections a bias term. Qwen2 trains
+    /// non-zero attention biases; dropping them silently degrades every
+    /// loaded Qwen checkpoint to gibberish output.
+    #[serde(default)]
+    pub qkv_bias: bool,
+    /// Hugging Face `model_type` this configuration came from (`qwen2`,
+    /// `llama`, `gemma`, ...). Selects the GGUF target architecture; empty
+    /// for synthetic configs.
+    #[serde(default)]
+    pub hf_model_type: String,
     /// Sliding-window attention size, if the model uses it.
     pub sliding_window: Option<usize>,
     /// `true` -> GELU gated MLP (Gemma), `false` -> SiLU gated MLP.
@@ -56,6 +66,10 @@ impl LlmModelConfig {
             rope_theta: cfg.rope_theta,
             rms_eps: cfg.rms_norm_eps,
             tie_word_embeddings: cfg.tie_word_embeddings,
+            // Hugging Face's Qwen2Config defaults `attention_bias` to true
+            // and most Qwen releases omit the key from config.json.
+            qkv_bias: cfg.attention_bias.unwrap_or(cfg.model_type == "qwen2"),
+            hf_model_type: cfg.model_type.clone(),
             sliding_window: cfg.sliding_window,
             use_gelu: cfg.hidden_act == "gelu" || cfg.hidden_act == "gelu_pytorch_tanh",
             has_qk_norm: cfg.has_qk_norm,
@@ -63,8 +77,19 @@ impl LlmModelConfig {
     }
 
     /// The GGUF architecture string to use when exporting.
+    ///
+    /// Qwen2 must be exported under its own `qwen2` architecture — llama.cpp
+    /// applies NEOX-style RoPE to unpermuted HF-layout Q/K weights for it,
+    /// whereas the `llama` architecture expects interleaved (permuted) Q/K.
+    /// Exporting a Qwen model as `llama` loads fine but generates garbage.
     pub fn gguf_architecture(&self) -> &'static str {
-        if self.has_qk_norm { "gemma" } else { "llama" }
+        if self.hf_model_type == "qwen2" {
+            "qwen2"
+        } else if self.has_qk_norm {
+            "gemma"
+        } else {
+            "llama"
+        }
     }
 
     /// A small test configuration.
@@ -81,6 +106,8 @@ impl LlmModelConfig {
             rope_theta: 10_000.0,
             rms_eps: 1e-6,
             tie_word_embeddings: false,
+            qkv_bias: false,
+            hf_model_type: String::new(),
             sliding_window: None,
             use_gelu: false,
             has_qk_norm: false,
@@ -126,6 +153,7 @@ impl<B: Backend> Transformer<B> {
                     config.rope_theta,
                     config.sliding_window,
                     config.has_qk_norm,
+                    config.qkv_bias,
                     config.rms_eps,
                     device,
                 );

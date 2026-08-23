@@ -26,9 +26,27 @@ The compiled binary is placed at `target/debug/llm-burner` or `target/release/ll
 | Feature | Default | Backend |
 | --- | --- | --- |
 | `gpu` | yes | Burn fused wgpu backend: Vulkan on Linux/Windows, Metal on macOS. The device is picked automatically, preferring high-power GPUs; override with `CUBECL_WGPU_DEFAULT_DEVICE` (e.g. `IntegratedGpu(0)`, `Cpu`). |
-| `flex` | no (`--no-default-features --features flex`) | Pure-Rust CPU backend with SIMD; training runs f32 math either way. |
+| `flex` | no (`--no-default-features --features flex`) | Pure-Rust CPU backend with SIMD; computes in f32 only. |
 
-Training always computes in f32; `--precision` controls only the dtype of exported safetensors weights.
+`--precision f32|bf16|f16` selects the dtype for checkpoint loading, training math,
+optimizer state, and safetensors export on GPU builds — the whole stack runs in the
+selected precision (F32 remains the default because pure half-precision AdamW can be
+numerically fragile). On `flex` builds only f32 is available.
+
+> **Known issue:** on AMD RADV (Mesa ≤ 25.0.x) `--precision bf16` segfaults inside
+> `libvulkan_radeon.so` while compiling cubecl's bf16 compute pipelines (bf16 is
+> emulated through bit-manipulation SPIR-V that trips this driver). `--precision f16`
+> works — WGSL supports it natively. Revisit bf16 after a Mesa upgrade.
+
+Use `--no-tui` to skip the Ratatui dashboard (tests, CI, non-interactive runs);
+progress goes to the log file only.
+
+While training runs, raw stdout/stderr are redirected into `train.log` so cubecl/wgpu
+compile diagnostics cannot garble the Ratatui dashboard; everything lands in
+`artifacts/trained/train.log`.
+
+Corpus tokenization streams files in ~1 MiB line-aligned chunks into a flat window
+arena, so peak RAM stays around a few hundred MB even for multi-gigabyte corpora.
 
 > **Tip:** always train with `--release`. Debug builds compile compute shaders far slower and can overflow the stack while cubecl autotunes kernels on first use.
 
@@ -55,28 +73,41 @@ Because `llm-burner` implements a lightweight, architecture-compatible transform
 
 ## Usage & Commands
 
+All commands default to a single output root, `./artifacts/` (override with `--out`):
+
+```
+artifacts/
+├── models/<owner>--<name>/     # downloaded model snapshots
+├── datasets/<owner>--<name>/   # downloaded text corpora
+└── trained/                    # fine-tuned outputs
+    ├── model.safetensors       # retrainable checkpoint (--precision)
+    ├── model.gguf              # quantized Q4_K_M export
+    ├── config.json
+    └── tokenizer.json (+ tokenizer_config.json)
+```
+
+The `trained/` directory is self-contained: pass it to `export --model-dir` (or share it) without extra files.
+
 ### 1. Download Model and Dataset
-Downloads `config.json`, tokenizer files, and `.safetensors` weights into `./models/` and text corpus files into `./datasets/`.
+Downloads `config.json`, tokenizer files, and `.safetensors` weights into `./artifacts/models/` and text corpus files into `./artifacts/datasets/`.
 
 ```bash
 cargo run --release -- download \
   --model Qwen/Qwen2.5-0.5B \
-  --dataset wikitext \
-  --out .
+  --dataset wikitext
 ```
 
 ### 2. Fine-Tune and Export
-Fine-tunes the model on the downloaded corpus for an exact `--steps` count with a live Ratatui dashboard, then exports `model.safetensors` and `model.gguf` (`Q4K`) into the output directory.
+Fine-tunes the model on the downloaded corpus for an exact `--steps` count with a live Ratatui dashboard, then exports `model.safetensors` and `model.gguf` (`Q4K`) into `./artifacts/trained/`.
 
 ```bash
 cargo run --release -- train \
-  --model-dir ./models/Qwen--Qwen2.5-0.5B \
-  --dataset-dir ./datasets/wikitext--wikitext-2-raw-v1 \
+  --model-dir ./artifacts/models/Qwen--Qwen2.5-0.5B \
+  --dataset-dir ./artifacts/datasets/wikitext--wikitext-2-raw-v1 \
   --steps 200 \
   --batch-size 4 \
   --seq-len 128 \
-  --lr 3e-4 \
-  --out ./artifacts
+  --lr 3e-4
 ```
 
 Alternatively, `train` can auto-download the repositories on the fly if provided via `--model` and `--dataset` instead of local directories:
@@ -85,8 +116,7 @@ Alternatively, `train` can auto-download the repositories on the fly if provided
 cargo run --release -- train \
   --model Qwen/Qwen2.5-0.5B \
   --dataset wikitext \
-  --steps 100 \
-  --out ./artifacts
+  --steps 100
 ```
 
 ---
@@ -100,8 +130,7 @@ cargo run --release -- train \
   --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
   --dataset wikitext \
   --steps 200 \
-  --ablate-refusal \
-  --out ./artifacts
+  --ablate-refusal
 ```
 
 | Flag | Default | Description |

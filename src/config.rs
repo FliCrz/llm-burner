@@ -69,6 +69,9 @@ pub struct TransformersConfig {
     pub sliding_window: Option<usize>,
     /// MLP activation function. `silu` -> GEGLU, `gelu` -> GELU.
     pub hidden_act: String,
+    /// Whether the query/key/value projections carry a bias term (Qwen2
+    /// trains non-zero attention biases; Llama/Gemma/TinyLlama do not).
+    pub attention_bias: Option<bool>,
     /// Whether the model applies extra query/key norms (Gemma 2/3).
     pub has_qk_norm: bool,
 }
@@ -135,6 +138,7 @@ impl TransformersConfig {
             tie_word_embeddings: get_bool_opt(object, "tie_word_embeddings")?.unwrap_or(false),
             sliding_window: get_usize_opt(object, "sliding_window")?,
             hidden_act: get_string_opt(object, "hidden_act")?.unwrap_or_else(|| "silu".into()),
+            attention_bias: get_bool_opt(object, "attention_bias")?,
             has_qk_norm,
         })
     }
@@ -380,6 +384,48 @@ mod tests {
         assert_eq!(config.hidden_act, "gelu");
         assert!(config.has_qk_norm);
         assert_eq!(config.gguf_architecture(), "gemma");
+    }
+
+    #[test]
+    fn attention_bias_defaults_follow_model_family() {
+        // Qwen2Config defaults attention_bias to true; most Qwen releases
+        // omit the key entirely.
+        let qwen = TransformersConfig::from_value(&json!({
+            "model_type": "qwen2",
+            "hidden_size": 896,
+            "intermediate_size": 4864,
+            "num_attention_heads": 14,
+            "num_hidden_layers": 24,
+            "vocab_size": 151936,
+            "max_position_embeddings": 32768,
+        }))
+        .unwrap();
+        assert_eq!(qwen.attention_bias, None);
+
+        let llama = TransformersConfig::from_value(&json!({
+            "model_type": "llama",
+            "hidden_size": 576,
+            "intermediate_size": 1536,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 4,
+            "vocab_size": 32000,
+            "max_position_embeddings": 2048,
+        }))
+        .unwrap();
+        assert_eq!(llama.attention_bias, None);
+
+        let explicit = TransformersConfig::from_value(&json!({
+            "model_type": "qwen2",
+            "attention_bias": false,
+            "hidden_size": 896,
+            "intermediate_size": 4864,
+            "num_attention_heads": 14,
+            "num_hidden_layers": 24,
+            "vocab_size": 151936,
+            "max_position_embeddings": 32768,
+        }))
+        .unwrap();
+        assert_eq!(explicit.attention_bias, Some(false));
     }
 
     #[test]

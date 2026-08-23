@@ -7,6 +7,7 @@ pub mod export;
 pub mod hf;
 pub mod model;
 pub mod pipeline;
+pub mod probe;
 pub mod train;
 pub mod ui;
 
