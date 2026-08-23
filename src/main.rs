@@ -214,11 +214,15 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to create `{}`", out.display()))?;
             let trained_dir = out.join("trained");
             let log_path = out.join("train.log");
-            let log_file = std::fs::File::create(&log_path)
-                .with_context(|| format!("failed to create `{}`", log_path.display()))?;
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-                .target(env_logger::Target::Pipe(Box::new(log_file)))
-                .init();
+let _ = std::fs::remove_file(&log_path);
+let log_file = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&log_path)
+    .with_context(|| format!("failed to create `{}`", log_path.display()))?;
+env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    .target(env_logger::Target::Pipe(Box::new(log_file)))
+    .init();
             println!("logging to `{}`", log_path.display());
 
             let (mdir, ddir) =
