@@ -53,7 +53,7 @@ download:
 train:
 	@echo "--- Start training ---"
 	$(CARGO) run --release -- train $(ARGS)
-	@echo "--- End trainining ---"
+	@echo "--- End training ---"
 
 export-gguf:
 	@echo "Exporting to GGUF."
