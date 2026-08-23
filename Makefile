@@ -27,7 +27,7 @@ build:
 
 build-debug:
 	@echo "Building debug."
-	$(CARGO) build --debug
+	$(CARGO) build
 	@echo "Debug build ready."
 
 test:
