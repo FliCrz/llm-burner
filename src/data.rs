@@ -97,6 +97,9 @@ pub struct TokenizerStore {
     /// server) prompt the model with the format it was trained on instead of
     /// a fallback template.
     pub chat_template: Option<String>,
+    /// BPE merge rules from `tokenizer.json`, normalized to `"a b"` pairs.
+    /// Empty when the tokenizer defines no merges.
+    merges: Vec<String>,
 }
 
 impl TokenizerStore {
@@ -131,12 +134,40 @@ impl TokenizerStore {
                     .filter(|t| !t.is_empty())
                     .map(str::to_string)
             });
+        let merges = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| {
+                value
+                    .get("model")?
+                    .get("merges")?
+                    .as_array()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| match entry {
+                                // Modern format: [["Ġ", "t"], ...]
+                                serde_json::Value::Array(pair) => pair
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                                // Legacy format: ["Ġ t", ...]
+                                serde_json::Value::String(s) => s.clone(),
+                                _ => String::new(),
+                            })
+                            .filter(|m| !m.is_empty())
+                            .collect()
+                    })
+            })
+            .unwrap_or_default();
         Ok(Self {
             tokenizer,
             pad_id,
             eos_id,
             seq_len: 0,
             chat_template,
+            merges,
         })
     }
 
@@ -195,6 +226,21 @@ impl TokenizerStore {
         let mut vocab: Vec<(String, u32)> = self.tokenizer.get_vocab(true).into_iter().collect();
         vocab.sort_by_key(|(_, id)| *id);
         vocab
+    }
+
+    /// BPE merge rules in GGUF `tokenizer.ggml.merges` format (`"a b"`).
+    pub fn merges(&self) -> &[String] {
+        &self.merges
+    }
+
+    /// True when the vocabulary contains byte-fallback tokens of the form
+    /// `<0xNN>`. Such vocabs follow SentencePiece conventions (llama.cpp
+    /// `tokenizer.ggml.model = "llama"`) even when stored as BPE; vocabs
+    /// without them are GPT-2-style byte-level BPE
+    /// (`tokenizer.ggml.model = "gpt2"`, which requires merge rules).
+    pub fn has_byte_fallback(&self) -> bool {
+        const TOKEN_TYPE_BYTE: u32 = 6;
+        self.token_types().contains(&TOKEN_TYPE_BYTE)
     }
 
     /// GGUF `tokenizer.ggml.token_type` values ordered by token id.
@@ -546,6 +592,40 @@ mod tests {
         let store = TokenizerStore::from_file(&path).unwrap();
         drop(dir); // tokenizer already parsed into memory
         store
+    }
+
+    #[test]
+    fn parses_merges_from_tokenizer_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tok.json");
+        // Modern Qwen-style tokenizer.json: BPE model with pair-array merges.
+        std::fs::write(
+            &path,
+            r#"{"version":"1.0","added_tokens":[],"normalizer":null,
+                "pre_tokenizer":null,"post_processor":null,"decoder":null,
+                "model":{"type":"BPE","vocab":{"Ġ":0,"t":1,"Ġt":2},
+                         "merges":[["Ġ","t"]]}}"#,
+        )
+        .unwrap();
+        let store = TokenizerStore::from_file(&path).unwrap();
+        assert_eq!(store.merges(), ["Ġ t"]);
+
+        // Legacy format: space-joined string merges.
+        let path = dir.path().join("legacy.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"1.0","added_tokens":[],"normalizer":null,
+                "pre_tokenizer":null,"post_processor":null,"decoder":null,
+                "model":{"type":"BPE","vocab":{"Ġ":0,"t":1,"Ġt":2},
+                         "merges":["Ġ t"]}}"#,
+        )
+        .unwrap();
+        let store = TokenizerStore::from_file(&path).unwrap();
+        assert_eq!(store.merges(), ["Ġ t"]);
+
+        // A tokenizer without merges (e.g. WordLevel) yields none.
+        let store = word_pseudo_tokenizer();
+        assert!(store.merges().is_empty());
     }
 
     #[test]

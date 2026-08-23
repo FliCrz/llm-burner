@@ -96,11 +96,24 @@ pub fn load_from_safetensors<B: Backend>(
     }
 
     let missing: Vec<&String> = expected.difference(&applied).collect();
-    if !missing.is_empty() {
+    // Checkpoints fine-tuned before QKV-bias support legitimately lack the
+    // attention bias tensors; they were dropped (not adapted) during that
+    // run's load, so zero-initialized biases faithfully represent them.
+    let is_qkv_bias =
+        |p: &String| p.ends_with(".bias") && p.contains("_proj.bias") && !p.contains("o_proj");
+    let (missing_biases, missing_required): (Vec<&String>, Vec<&String>) =
+        missing.into_iter().partition(|p| is_qkv_bias(p));
+    if !missing_biases.is_empty() {
+        log::warn!(
+            "checkpoint has no attention QKV biases (pre-bias-support fine-tune); \
+             exporting with zero biases"
+        );
+    }
+    if !missing_required.is_empty() {
         anyhow::bail!(
             "the checkpoint is missing {} expected tensor(s): {:?}",
-            missing.len(),
-            missing
+            missing_required.len(),
+            missing_required
         );
     }
     Ok(())
@@ -232,5 +245,40 @@ mod tests {
         let mut dest = LlmModel::<B>::new(&bigger, &device);
         let err = load_from_safetensors(&mut dest, &[&path], DType::F32).unwrap_err();
         assert!(err.to_string().contains("missing"), "{}", err);
+    }
+
+    /// Checkpoints fine-tuned before QKV-bias support have no attention bias
+    /// tensors. Loading them into a bias-enabled model must succeed with the
+    /// biases left at their zero initialization (they were dropped — not
+    /// adapted — during that training run), while genuinely missing weights
+    /// still fail.
+    #[test]
+    fn missing_attention_biases_load_as_zeros() {
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig {
+            qkv_bias: false,
+            ..LlmModelConfig::tiny()
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("biasless.safetensors");
+        let source = LlmModel::<B>::new(&config, &device);
+        save_to_safetensors(&source, &path).unwrap();
+
+        let biased_config = LlmModelConfig {
+            qkv_bias: true,
+            ..config.clone()
+        };
+        let mut dest = LlmModel::<B>::new(&biased_config, &device);
+        load_from_safetensors(&mut dest, &[&path], DType::F32).unwrap();
+
+        // Biases must be exactly zero after loading.
+        for s in dest.collect(None, None, false) {
+            if s.full_path().ends_with("_proj.bias") {
+                let v = s.to_data().unwrap().to_vec::<f32>().unwrap();
+                assert!(v.iter().all(|&x| x == 0.0), "bias not zero-initialized");
+                return;
+            }
+        }
+        panic!("no bias tensor found in biased model");
     }
 }

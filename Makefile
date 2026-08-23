@@ -1,6 +1,7 @@
 .PHONY: build test fmt clippy download train export-gguf help
 
 CARGO ?= cargo
+INSTALL_DIR ?= $(HOME)/.local/bin
 
 help:
 	@echo "Available targets:"
@@ -37,3 +38,11 @@ train:
 
 export-gguf:
 	$(CARGO) run --release -- export $(ARGS)
+
+clean:
+	rm -rf target
+
+install:
+	@build
+	mv target/release/llm-burner $INSTALL_DIR
+	@clean
