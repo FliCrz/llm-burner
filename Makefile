@@ -72,7 +72,7 @@ install:
 
 uninstall:
 	@echo "Removing binary from $(INSTALL_DIR)."
-	rm $(INSTALL_DIR)/llm-burner
+	rm -f $(INSTALL_DIR)/llm-burner
 	@echo "Deleted binary."
 
 llm-burner: uninstall clean build install clean
