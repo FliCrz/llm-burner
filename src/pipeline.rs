@@ -145,9 +145,10 @@ fn copy_export_inputs(model_dir: &Path, out_dir: &Path) -> Result<()> {
 /// the requested precision.
 ///
 /// The GPU stack can hard-crash (SIGSEGV inside the driver) while compiling
-/// half-precision kernels, so callers must validate the dtype with
-/// [`crate::probe::spawn_probe`] first and fall back to
-/// [`run_pipeline_on_cpu`] when it does not succeed.
+/// half-precision kernels, so callers must validate dtypes with
+/// [`crate::probe::spawn_probe`] first and degrade along the ladder of
+/// [`crate::probe::BackendPlan`]: requested precision here, then
+/// [`run_pipeline_on_gpu_f32`], then [`run_pipeline_on_cpu`].
 #[cfg(feature = "gpu")]
 pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
     let backend = backend_label();
@@ -170,6 +171,17 @@ pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
     }
 }
 
+/// Run the full fine-tune-and-export pipeline on the GPU backend with f32
+/// compute, regardless of the requested precision.
+///
+/// Middle rung of the fallback ladder: when a buggy driver rejects half
+/// precision but accepts f32 (see [`crate::probe`]), training still runs on
+/// the GPU while checkpoint ingest and export follow `train.precision`.
+#[cfg(feature = "gpu")]
+pub fn run_pipeline_on_gpu_f32(inputs: &PipelineInputs) -> Result<()> {
+    run_pipeline_typed::<burn::backend::Wgpu<f32, i32>>(inputs, DType::F32, backend_label())
+}
+
 /// Run the pipeline on the CPU backend.
 ///
 /// Burn's Flex backend computes in f32 only (`Flex` is not generic over the
@@ -178,7 +190,7 @@ pub fn run_pipeline(inputs: &PipelineInputs) -> Result<()> {
 /// math runs in f32 (fp32 master weights are also the numerically safer
 /// recipe for AdamW), and safetensors export casts back down to the requested
 /// dtype. This is both the path for `--no-default-features --features flex`
-/// builds and the automatic fallback when the GPU probe rejects a dtype.
+/// builds and the last resort when no dtype survives the GPU probe.
 pub fn run_pipeline_on_cpu(inputs: &PipelineInputs) -> Result<()> {
     if inputs.train.precision != Precision::F32 {
         log::warn!(
@@ -232,11 +244,7 @@ fn output_slug(model_dir: &Path, dataset_dir: &Path) -> String {
 /// parameter dtype of `B` — checkpoints are cast to it on ingest, while
 /// safetensors export follows `train.precision` (they differ on the CPU
 /// fallback path).
-fn run_pipeline_typed<B>(
-    inputs: &PipelineInputs,
-    load_dtype: DType,
-    backend: &str,
-) -> Result<()>
+fn run_pipeline_typed<B>(inputs: &PipelineInputs, load_dtype: DType, backend: &str) -> Result<()>
 where
     B: Backend,
     Autodiff<B>: burn::tensor::backend::AutodiffBackend<InnerBackend = B>,
