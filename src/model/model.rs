@@ -92,6 +92,43 @@ impl LlmModelConfig {
         }
     }
 
+    /// Number of trainable parameters this configuration instantiates.
+    ///
+    /// Mirrors [`Transformer::new`] / [`LlmModel::new`] exactly (projection
+    /// shapes, optional QKV biases, optional Q/K norms, tied embeddings) so
+    /// callers can size a run — e.g. the memory pre-flight in the pipeline —
+    /// without building the model. Verified against a real instantiation in
+    /// the unit tests.
+    pub fn param_count(&self) -> u64 {
+        let d = self.d_model as u64;
+        let q_out = (self.n_heads * self.head_dim) as u64;
+        let kv_out = (self.n_kv_heads * self.head_dim) as u64;
+        let i = self.intermediate_size as u64;
+        let vocab = self.vocab_size as u64;
+
+        // Attention: q/k/v write `d_model -> q_out|kv_out`, o_proj reads back
+        // `q_out -> d_model`; only q/k/v carry biases.
+        let mut attn = q_out * d + 2 * (kv_out * d) + q_out * d;
+        if self.qkv_bias {
+            attn += q_out + 2 * kv_out;
+        }
+        if self.has_qk_norm {
+            attn += 2 * self.head_dim as u64;
+        }
+        // MLP: gate and up are `d_model -> intermediate`, down goes back.
+        let mlp = 2 * (d * i) + i * d;
+        // Two RMSNorm gains per decoder layer plus one final norm gain.
+        let layer = attn + mlp + 2 * d;
+
+        let mut n = d * vocab; // embed_tokens
+        n += layer * self.n_layers as u64;
+        n += d; // model.norm
+        if !self.tie_word_embeddings {
+            n += d * vocab; // lm_head
+        }
+        n
+    }
+
     /// A small test configuration.
     pub fn tiny() -> Self {
         Self {

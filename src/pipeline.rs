@@ -192,6 +192,147 @@ pub fn run_pipeline_on_cpu(inputs: &PipelineInputs) -> Result<()> {
     run_pipeline_typed::<burn::backend::Flex<f32, i32>>(inputs, DType::F32, "Flex/CPU")
 }
 
+// ---------- memory pre-flight ----------
+
+/// Rough peak-memory footprint of a fine-tuning run, in bytes.
+#[derive(Debug, Clone, Copy)]
+struct TrainingMemory {
+    /// Model parameters.
+    weights: u64,
+    /// One gradient per parameter, held for the optimizer step.
+    gradients: u64,
+    /// AdamW keeps two moment buffers (`exp_avg`, `exp_avg_sq`) per parameter.
+    optimizer: u64,
+    /// Live activations of forward + backward (heuristic upper bound).
+    activations: u64,
+}
+
+impl TrainingMemory {
+    fn total(&self) -> u64 {
+        self.weights + self.gradients + self.optimizer + self.activations
+    }
+}
+
+/// Estimate the peak memory of a fine-tune: weights + gradients + AdamW state
+/// (4x the parameter bytes) plus a heuristic activation bound — roughly 16
+/// hidden-sized and 8 intermediate-sized tensors per decoder layer (forward
+/// values kept alive for backward), plus ~3 vocabulary-sized logits/softmax
+/// buffers. Deliberately conservative: better to refuse an oversized run than
+/// to let it die mid-autotune inside wgpu.
+fn estimate_training_memory(
+    params: u64,
+    elem_size: usize,
+    batch_size: usize,
+    seq_len: usize,
+    config: &LlmModelConfig,
+) -> TrainingMemory {
+    let elem = elem_size as u64;
+    let p = params.max(1);
+    let tokens = batch_size.max(1).saturating_mul(seq_len.max(1)) as u64;
+    let per_layer =
+        16 * config.d_model as u64 + 8 * config.intermediate_size as u64;
+    let logits = 3 * config.vocab_size.max(1) as u64;
+    TrainingMemory {
+        weights: p * elem,
+        gradients: p * elem,
+        optimizer: 2 * p * elem,
+        activations: tokens * elem * (per_layer * config.n_layers as u64 + logits),
+    }
+}
+
+/// Extract `MemAvailable:` (converted to bytes) from `/proc/meminfo` content.
+fn parse_mem_available(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// Memory the kernel estimates could be handed out without swapping
+/// (`/proc/meminfo`'s `MemAvailable`). `None` off Linux or when unreadable.
+fn available_memory_bytes() -> Option<u64> {
+    parse_mem_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Format bytes as Gibibytes with one decimal.
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// Refuse to start a fine-tune whose estimated memory footprint exceeds what
+/// the machine can currently provide. An oversized run otherwise dies deep
+/// inside the GPU stack with cryptic panics once a buffer allocation fails.
+///
+/// Skipped silently when the model config cannot be read (the loader reports
+/// that with its own error) or `/proc/meminfo` is unavailable (non-Linux).
+fn check_memory_fit(model_dir: &Path, train: &TrainConfig) -> Result<()> {
+    let Some(available) = available_memory_bytes() else {
+        log::debug!("memory pre-flight skipped: /proc/meminfo unavailable");
+        return Ok(());
+    };
+    match check_memory_against(model_dir, train, available) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// [`check_memory_fit`] against a caller-supplied availability figure
+/// (testable; also the actual decision body).
+fn check_memory_against(model_dir: &Path, train: &TrainConfig, available: u64) -> Result<()> {
+    let Ok(transformers) = TransformersConfig::from_path(model_dir.join("config.json")) else {
+        return Ok(());
+    };
+    let config = LlmModelConfig::from_transformers(&transformers);
+    let params = config.param_count();
+    let estimate = |elem: usize| {
+        estimate_training_memory(params, elem, train.batch_size, train.seq_len, &config)
+    };
+    let est = estimate(train.precision.elem_size());
+
+    log::info!(
+        "memory pre-flight: need {} (weights {} + gradients {} + AdamW {} + \
+         activations {}; {} parameters), {} available",
+        gib(est.total()),
+        gib(est.weights),
+        gib(est.gradients),
+        gib(est.optimizer),
+        gib(est.activations),
+        params,
+        gib(available),
+    );
+
+    if est.total() <= available {
+        return Ok(());
+    }
+
+    let remedy = if train.precision == Precision::F32 {
+        format!(
+            "Try `--precision bf16` (estimated {}), or lower `--batch-size` / `--seq-len`",
+            gib(estimate(Precision::Bf16.elem_size()).total())
+        )
+    } else {
+        "Try lowering `--batch-size` / `--seq-len`".to_string()
+    };
+    bail!(
+        "not enough memory to fine-tune `{}` in {}: estimated {} \
+         (weights {} + gradients {} + AdamW state {} + activations {} at \
+         batch {} x seq_len {}), but only {} is currently available. {remedy}",
+        model_dir.display(),
+        train.precision,
+        gib(est.total()),
+        gib(est.weights),
+        gib(est.gradients),
+        gib(est.optimizer),
+        gib(est.activations),
+        train.batch_size,
+        train.seq_len,
+        gib(available),
+    )
+}
+
 /// Output file name component for a downloaded repo directory: HF snapshot
 /// dirs are named `<owner>--<name>`, so keep only `<name>`; anything that is
 /// not filename-safe becomes `-`.
@@ -242,6 +383,9 @@ where
     Autodiff<B>: burn::tensor::backend::AutodiffBackend<InnerBackend = B>,
     f32: From<<Autodiff<B> as burn::tensor::backend::BackendTypes>::FloatElem>,
 {
+    // Fail fast (before allocating weights) when this run cannot fit.
+    check_memory_fit(&inputs.model_dir, &inputs.train)?;
+
     log::info!(
         "loading model from `{}` as {}",
         inputs.model_dir.display(),

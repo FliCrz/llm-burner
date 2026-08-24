@@ -113,6 +113,14 @@ impl Precision {
             Precision::F16 => DType::F16,
         }
     }
+
+    /// Size in bytes of one element of this dtype.
+    pub fn elem_size(self) -> usize {
+        match self {
+            Precision::F32 => 4,
+            Precision::Bf16 | Precision::F16 => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
