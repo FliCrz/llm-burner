@@ -266,31 +266,38 @@ env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info
 
             // Pre-flight: half-precision kernels can segfault buggy GPU
             // drivers (Mesa RADV on some AMD iGPUs), which is unrecoverable
-            // in-process. Validate the requested dtype in a throwaway child
-            // and fall back to CPU training when it does not come back clean.
+            // in-process. Validate dtypes in throwaway children and degrade
+            // along the ladder: requested precision → f32 compute on the
+            // GPU → CPU training.
             #[cfg(feature = "gpu")]
-            let gpu_ok = {
-                use llm_burner::probe::{ProbeOutcome, spawn_probe};
+            {
+                use llm_burner::probe::{BackendPlan, resolve_backend_plan};
                 let exe = std::env::current_exe()
                     .context("cannot locate own executable for the GPU probe")?;
-                match spawn_probe(&exe, precision, llm_burner::probe::PROBE_TIMEOUT) {
-                    ProbeOutcome::Success => true,
-                    outcome => {
-                        log::warn!(
-                            "GPU probe for {precision} did not succeed: {outcome}; \
-                             falling back to the CPU backend (f32 compute, \
-                             {precision} checkpoint load/export)"
-                        );
-                        false
-                    }
+                let probe_exe = exe.clone();
+                let (plan, notes) = resolve_backend_plan(precision, |p| {
+                    llm_burner::probe::spawn_probe(&probe_exe, p, llm_burner::probe::PROBE_TIMEOUT)
+                });
+                // Fallbacks must be visible even when the TUI later owns the
+                // terminal and train.log is not being watched.
+                for note in &notes {
+                    log::warn!("{note}");
+                    println!("{note}");
                 }
-            };
-            #[cfg(feature = "gpu")]
-            if gpu_ok {
-                log::info!("backend: {}", llm_burner::train::backend_label());
-                llm_burner::pipeline::run_pipeline(&inputs)?;
-            } else {
-                llm_burner::pipeline::run_pipeline_on_cpu(&inputs)?;
+                match plan {
+                    BackendPlan::RequestedPrecision => {
+                        log::info!("backend: {}", llm_burner::train::backend_label());
+                        llm_burner::pipeline::run_pipeline(&inputs)?;
+                    }
+                    BackendPlan::F32Compute => {
+                        log::info!(
+                            "backend: {} (f32 compute)",
+                            llm_burner::train::backend_label()
+                        );
+                        llm_burner::pipeline::run_pipeline_on_gpu_f32(&inputs)?;
+                    }
+                    BackendPlan::Cpu => llm_burner::pipeline::run_pipeline_on_cpu(&inputs)?,
+                }
             }
             #[cfg(not(feature = "gpu"))]
             {

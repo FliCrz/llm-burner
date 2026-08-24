@@ -6,7 +6,9 @@
 //! Mesa 25.0.7). A SIGSEGV raised inside the driver cannot be caught in
 //! process, so before committing to a half-precision GPU run we execute a
 //! tiny kernel of the requested dtype in a throwaway child process and
-//! degrade gracefully (CPU fallback) if the child dies.
+//! degrade gracefully if the child dies — first to f32 compute on the same
+//! GPU (checkpoints keep the requested precision), then to CPU training
+//! ([`resolve_backend_plan`]).
 
 use std::io::Read;
 use std::path::Path;
@@ -46,6 +48,68 @@ impl std::fmt::Display for ProbeOutcome {
             Self::Failed { detail } => write!(f, "failed: {detail}"),
         }
     }
+}
+
+/// Which compiled backend configuration a training run should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPlan {
+    /// The requested precision on the GPU backend.
+    RequestedPrecision,
+    /// f32 compute on the GPU backend; checkpoint load and export still
+    /// honor the requested precision.
+    F32Compute,
+    /// The Flex CPU fallback (f32 compute only).
+    Cpu,
+}
+
+/// Resolve how training should run by probing GPU dtypes out-of-process.
+///
+/// Fallback ladder:
+/// 1. The requested dtype passes its probe → run it on the GPU as-is.
+/// 2. A half-precision dtype fails → re-probe f32; if that works, train on
+///    the GPU with f32 compute while checkpoints still follow the requested
+///    precision (the same mixed-precision contract as the CPU fallback).
+/// 3. Nothing works on the GPU (or f32 itself was rejected) → CPU fallback.
+///
+/// `probe` abstracts [`spawn_probe`] so callers can inject outcomes in tests;
+/// f32 is never probed twice and not probed at all when it *is* the
+/// requested dtype. Human-readable notes describing every degradation are
+/// returned alongside the plan; surface them to the user (log and terminal)
+/// so silent slowdowns stay visible.
+pub fn resolve_backend_plan<F>(requested: Precision, mut probe: F) -> (BackendPlan, Vec<String>)
+where
+    F: FnMut(Precision) -> ProbeOutcome,
+{
+    let mut notes = Vec::new();
+    let requested_outcome = probe(requested);
+    if requested_outcome.is_success() {
+        return (BackendPlan::RequestedPrecision, notes);
+    }
+    if requested == Precision::F32 {
+        notes.push(format!(
+            "GPU probe for f32 did not succeed ({requested_outcome}); \
+             falling back to the CPU backend"
+        ));
+        return (BackendPlan::Cpu, notes);
+    }
+    notes.push(format!(
+        "GPU probe for {requested} did not succeed ({requested_outcome}); \
+         probing f32 on the GPU instead"
+    ));
+    let f32_outcome = probe(Precision::F32);
+    if f32_outcome.is_success() {
+        notes.push(format!(
+            "GPU accepted f32: training will compute in f32 on the GPU; \
+             {requested} still applies to checkpoint load and export"
+        ));
+        return (BackendPlan::F32Compute, notes);
+    }
+    notes.push(format!(
+        "GPU probe for f32 did not succeed either ({f32_outcome}); \
+         falling back to the CPU backend (f32 compute, {requested} \
+         checkpoint load/export)"
+    ));
+    (BackendPlan::Cpu, notes)
 }
 
 /// Spawn `exe gpu-probe --precision <precision>` and classify termination.
@@ -195,11 +259,8 @@ mod tests {
 
     #[test]
     fn slow_child_times_out_and_is_killed() {
-        let outcome = spawn_and_classify(
-            Path::new("/bin/sleep"),
-            &["30"],
-            Duration::from_millis(300),
-        );
+        let outcome =
+            spawn_and_classify(Path::new("/bin/sleep"), &["30"], Duration::from_millis(300));
         assert_eq!(outcome, ProbeOutcome::TimedOut);
     }
 
@@ -211,5 +272,74 @@ mod tests {
             PROBE_TIMEOUT,
         );
         assert!(matches!(outcome, ProbeOutcome::Failed { .. }));
+    }
+
+    // ---------- backend plan ladder ----------
+
+    fn fake_outcome(ok: bool) -> ProbeOutcome {
+        if ok {
+            ProbeOutcome::Success
+        } else {
+            ProbeOutcome::Failed {
+                detail: "terminated by signal 11".to_string(),
+            }
+        }
+    }
+
+    #[test]
+    fn passing_requested_precision_needs_no_fallback() {
+        for precision in [Precision::F32, Precision::Bf16, Precision::F16] {
+            let (plan, notes) = resolve_backend_plan(precision, |_| fake_outcome(true));
+            assert_eq!(plan, BackendPlan::RequestedPrecision);
+            assert!(notes.is_empty(), "unexpected notes: {notes:?}");
+        }
+    }
+
+    #[test]
+    fn bf16_failure_degrades_to_f32_compute_on_gpu() {
+        let mut probed = Vec::new();
+        let (plan, notes) = resolve_backend_plan(Precision::Bf16, |p| {
+            probed.push(p);
+            if p == Precision::F32 {
+                ProbeOutcome::Success
+            } else {
+                ProbeOutcome::TimedOut
+            }
+        });
+        assert_eq!(probed, vec![Precision::Bf16, Precision::F32]);
+        assert_eq!(plan, BackendPlan::F32Compute);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("compute in f32 on the GPU")),
+            "notes should announce f32-on-GPU degradation: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_rejected_entirely_lands_on_cpu() {
+        let mut probed = Vec::new();
+        let (plan, notes) = resolve_backend_plan(Precision::F16, |p| {
+            probed.push(p);
+            fake_outcome(false)
+        });
+        assert_eq!(probed, vec![Precision::F16, Precision::F32]);
+        assert_eq!(plan, BackendPlan::Cpu);
+        assert!(
+            notes.iter().any(|n| n.contains("falling back to the CPU")),
+            "notes should announce the CPU fallback: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn failed_f32_request_never_reprobes_itself() {
+        let mut probed = Vec::new();
+        let (plan, notes) = resolve_backend_plan(Precision::F32, |p| {
+            probed.push(p);
+            fake_outcome(false)
+        });
+        assert_eq!(probed, vec![Precision::F32]);
+        assert_eq!(plan, BackendPlan::Cpu);
+        assert!(notes.iter().all(|n| !n.contains("either")));
     }
 }
