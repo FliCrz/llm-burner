@@ -298,8 +298,15 @@ where
         inputs.train.precision,
         backend
     );
+    // Label the dashboard header with the repo names behind the input
+    // directories, matching how the trained outputs are named.
+    let mut train_cfg = inputs.train.clone();
+    train_cfg.run_info = crate::ui::RunInfo {
+        model: dir_slug(&inputs.model_dir),
+        dataset: dir_slug(&inputs.dataset_dir),
+    };
     let ad_model: LlmModel<Autodiff<B>> = model.train();
-    let trained = train_model(ad_model, &windows, tokenizer.pad_id, &inputs.train);
+    let trained = train_model(ad_model, &windows, tokenizer.pad_id, &train_cfg);
 
     // Outputs are grouped under `<model-name>_<dataset-name>` so concurrent
     // fine-tunes of different model/dataset pairs never collide:

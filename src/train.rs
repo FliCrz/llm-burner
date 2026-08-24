@@ -139,6 +139,10 @@ pub struct TrainConfig {
     /// While the training dashboard owns the terminal, raw stdout/stderr are
     /// redirected into this file so library output cannot garble the TUI.
     pub output_redirect: Option<PathBuf>,
+    /// Model/dataset labels shown in the dashboard header. Empty by default
+    /// (the header line is hidden); the pipeline fills it from the input
+    /// directories.
+    pub run_info: crate::ui::RunInfo,
 }
 
 impl Default for TrainConfig {
@@ -153,6 +157,7 @@ impl Default for TrainConfig {
             precision: Precision::default(),
             tui: true,
             output_redirect: None,
+            run_info: Default::default(),
         }
     }
 }
@@ -210,6 +215,7 @@ where
     let batches = windows.batch_count(cfg.batch_size);
     let dashboard = if cfg.tui {
         Some(Dashboard::start_with_output_redirect(
+            cfg.run_info.clone(),
             cfg.steps,
             cfg.output_redirect.as_deref(),
         ))
@@ -313,6 +319,7 @@ mod tests {
             precision: Precision::F32,
             tui: false,
             output_redirect: None,
+            run_info: Default::default(),
         };
 
         let device = Default::default();

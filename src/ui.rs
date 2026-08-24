@@ -28,6 +28,22 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline};
 use ratatui::{DefaultTerminal, Frame, Terminal, init, restore};
 
+/// Static run identity shown in the dashboard header.
+#[derive(Debug, Clone, Default)]
+pub struct RunInfo {
+    /// Name of the model checkpoint being fine-tuned.
+    pub model: String,
+    /// Name of the text corpus used for training.
+    pub dataset: String,
+}
+
+impl RunInfo {
+    /// Whether either label carries something worth displaying.
+    fn is_present(&self) -> bool {
+        !self.model.is_empty() || !self.dataset.is_empty()
+    }
+}
+
 /// A progress event sent from the training loop to the dashboard thread.
 enum Event {
     /// A training step completed.
@@ -44,6 +60,7 @@ pub struct Dashboard {
 
 /// Rendering state shared between the loop and the draw closure.
 struct State {
+    run_info: RunInfo,
     steps: usize,
     step: usize,
     loss: f32,
@@ -57,18 +74,23 @@ impl Dashboard {
     /// Stdout/stderr are not redirected; prefer
     /// [`Dashboard::start_with_output_redirect`] whenever a log file is
     /// available so library output cannot garble the TUI.
-    pub fn start(steps: usize) -> Self {
-        Self::start_with_output_redirect(steps, None)
+    pub fn start(run_info: RunInfo, steps: usize) -> Self {
+        Self::start_with_output_redirect(run_info, steps, None)
     }
 
     /// Start the dashboard and redirect raw stdout/stderr writes into
     /// `log_path` (opened in append mode) for as long as the TUI owns the
     /// terminal. The TUI itself renders through a saved duplicate of the
-    /// original stdout, so it is unaffected by the redirection.
-    pub fn start_with_output_redirect(steps: usize, log_path: Option<&Path>) -> Self {
+    /// original stdout, so it is unaffected by the redirection. `run_info`
+    /// labels the header with the model and dataset under training.
+    pub fn start_with_output_redirect(
+        run_info: RunInfo,
+        steps: usize,
+        log_path: Option<&Path>,
+    ) -> Self {
         let (tx, rx) = channel();
         let log_path = log_path.map(Path::to_path_buf);
-        let handle = std::thread::spawn(move || run(rx, steps, log_path));
+        let handle = std::thread::spawn(move || run(rx, run_info, steps, log_path));
         Self {
             tx,
             handle: Some(handle),
@@ -90,8 +112,9 @@ impl Dashboard {
 }
 
 /// Run the renderer until the sender is dropped or a `Done` event arrives.
-fn run(rx: Receiver<Event>, steps: usize, redirect_log: Option<PathBuf>) {
+fn run(rx: Receiver<Event>, run_info: RunInfo, steps: usize, redirect_log: Option<PathBuf>) {
     let mut state = State {
+        run_info,
         steps,
         step: 0,
         loss: 0.0,
@@ -283,8 +306,9 @@ impl Drop for OutputRedirect {
 
 /// Render a single frame.
 fn draw(frame: &mut Frame<'_>, state: &State) {
+    let show_run_info = state.run_info.is_present();
     let layout = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(if show_run_info { 4 } else { 3 }),
         Constraint::Length(3),
         Constraint::Length(4),
         Constraint::Length(3),
@@ -292,7 +316,7 @@ fn draw(frame: &mut Frame<'_>, state: &State) {
     ])
     .split(frame.area());
 
-    let title = Paragraph::new(Line::from(vec![
+    let mut header = vec![Line::from(vec![
         Span::styled(
             " llm-burner ",
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -301,8 +325,25 @@ fn draw(frame: &mut Frame<'_>, state: &State) {
             " — Gemma-style transformer fine-tuning",
             Style::new().fg(Color::Gray),
         ),
-    ]))
-    .block(Block::new().borders(Borders::ALL).title("Training"));
+    ])];
+    if show_run_info {
+        header.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("model ", Style::new().fg(Color::Gray)),
+            Span::styled(
+                state.run_info.model.clone(),
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::raw("  "),
+            Span::styled("dataset ", Style::new().fg(Color::Gray)),
+            Span::styled(
+                state.run_info.dataset.clone(),
+                Style::new().fg(Color::Cyan),
+            ),
+        ]));
+    }
+
+    let title = Paragraph::new(header).block(Block::new().borders(Borders::ALL).title("Training"));
 
     let percent = if state.steps == 0 {
         0.0

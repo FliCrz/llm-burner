@@ -254,6 +254,7 @@ env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info
                     precision,
                     tui: !no_tui,
                     output_redirect: Some(log_path.clone()),
+                    run_info: Default::default(),
                 },
                 ablation: ablate_refusal.then_some(llm_burner::model::ablation::AblationConfig {
                     direction_layer: refusal_layer,
