@@ -245,6 +245,50 @@ mod tests {
         assert!(err.to_string().contains("missing"), "{}", err);
     }
 
+    /// Regression test for loading google/gemma-2b: its config.json omits
+    /// `tie_word_embeddings` (HF's Gemma default ties embeddings, so the
+    /// checkpoint stores no `lm_head.weight`) and the original `gemma` model
+    /// type has no per-head query/key norm tensors. The parsed config must
+    /// build a matching model or every load fails with dozens of "missing"
+    /// tensors.
+    #[test]
+    fn gemma1_tied_untied_qk_norms_load() {
+        let device = burn::backend::flex::FlexDevice;
+        let transformers =
+            crate::config::TransformersConfig::from_value(&serde_json::json!({
+                "model_type": "gemma",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "num_hidden_layers": 2,
+                "vocab_size": 256,
+                "max_position_embeddings": 64
+            }))
+            .unwrap();
+        let config = crate::model::LlmModelConfig::from_transformers(&transformers);
+        assert!(config.tie_word_embeddings, "gemma must default to tied");
+        assert!(!config.has_qk_norm, "gemma (1) has no query/key norms");
+
+        let source = LlmModel::<B>::new(&config, &device);
+        assert!(
+            !source
+                .collect(None, None, false)
+                .iter()
+                .any(|s| s.full_path().contains("lm_head")
+                    || s.full_path().contains("q_norm")
+                    || s.full_path().contains("k_norm"))
+        );
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gemma1.safetensors");
+        save_to_safetensors(&source, &path).unwrap();
+
+        let mut dest = LlmModel::<B>::new(&config, &device);
+        load_from_safetensors(&mut dest, &[&path], DType::F32).unwrap();
+    }
+
     /// Checkpoints fine-tuned before QKV-bias support have no attention bias
     /// tensors. Loading them into a bias-enabled model must succeed with the
     /// biases left at their zero initialization (they were dropped — not

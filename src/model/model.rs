@@ -82,10 +82,15 @@ impl LlmModelConfig {
     /// applies NEOX-style RoPE to unpermuted HF-layout Q/K weights for it,
     /// whereas the `llama` architecture expects interleaved (permuted) Q/K.
     /// Exporting a Qwen model as `llama` loads fine but generates garbage.
+    ///
+    /// Every Gemma generation — including the original `gemma`, which has no
+    /// per-head Q/K norms — uses NEOX-style RoPE and must map to `gemma`;
+    /// keying this on [`LlmModelConfig::has_qk_norm`] would wrongly export
+    /// Gemma-1 checkpoints as `llama`.
     pub fn gguf_architecture(&self) -> &'static str {
         if self.hf_model_type == "qwen2" {
             "qwen2"
-        } else if self.has_qk_norm {
+        } else if self.hf_model_type.starts_with("gemma") {
             "gemma"
         } else {
             "llama"
