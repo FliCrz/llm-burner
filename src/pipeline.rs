@@ -254,7 +254,7 @@ fn estimate_training_memory(
         weights: p * elem,
         gradients: p * elem,
         optimizer: 2 * p * elem,
-        activations: tokens * elem * (per_layer * config.n_layers as u64 + logits),
+        activations: tokens.saturating_mul(elem).saturating_mul(per_layer.saturating_mul(config.n_layers as u64).saturating_add(logits)),
     }
 }
 
