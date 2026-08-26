@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use llm_burner::data::HfDataset;
 use llm_burner::hf::HfRepo;
 use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir};
+use llm_burner::probe::DeviceChoice;
 use llm_burner::train::{Precision, TrainConfig};
 
 /// A simplified Gemma-family LLM fine-tuner for Burn.
@@ -91,6 +92,12 @@ enum Command {
         /// loading, training math, optimizer state, and safetensors export.
         #[arg(long, default_value_t = Precision::F32)]
         precision: Precision,
+
+        /// Training device: `auto` probes the GPU and degrades (requested
+        /// precision → f32 compute → CPU), `cpu` forces the CPU backend and
+        /// skips probing, `gpu` fails instead of falling back to CPU.
+        #[arg(long, default_value_t = DeviceChoice::Auto)]
+        device: DeviceChoice,
 
         /// Remove the model's refusal direction before fine-tuning
         /// (abliteration). The change is baked into the exported weights.
@@ -204,6 +211,7 @@ fn main() -> anyhow::Result<()> {
             max_workers,
             no_tui,
             precision,
+            device,
             ablate_refusal,
             refusal_layer,
             ablate_scale,
@@ -214,15 +222,15 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("failed to create `{}`", out.display()))?;
             let trained_dir = out.join("trained");
             let log_path = out.join("train.log");
-let _ = std::fs::remove_file(&log_path);
-let log_file = std::fs::OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(&log_path)
-    .with_context(|| format!("failed to create `{}`", log_path.display()))?;
-env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-    .target(env_logger::Target::Pipe(Box::new(log_file)))
-    .init();
+            let _ = std::fs::remove_file(&log_path);
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .with_context(|| format!("failed to create `{}`", log_path.display()))?;
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .target(env_logger::Target::Pipe(Box::new(log_file)))
+                .init();
             println!("logging to `{}`", log_path.display());
 
             let (mdir, ddir) =
@@ -262,28 +270,52 @@ env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info
                     harmful_file,
                     harmless_file,
                 }),
+                // Only an explicit `--device cpu` downgrades the memory
+                // pre-flight to a warning; automatic fallbacks stay strict.
+                memory_fit_enforced: device != DeviceChoice::Cpu,
             };
 
             // Pre-flight: half-precision kernels can segfault buggy GPU
             // drivers (Mesa RADV on some AMD iGPUs), which is unrecoverable
             // in-process. Validate dtypes in throwaway children and degrade
             // along the ladder: requested precision → f32 compute on the
-            // GPU → CPU training.
+            // GPU → CPU training. `--device cpu` skips probing entirely;
+            // `--device gpu` refuses the CPU rung.
             #[cfg(feature = "gpu")]
             {
                 use llm_burner::probe::{BackendPlan, resolve_backend_plan};
-                let exe = std::env::current_exe()
-                    .context("cannot locate own executable for the GPU probe")?;
-                let probe_exe = exe.clone();
-                let (plan, notes) = resolve_backend_plan(precision, |p| {
-                    llm_burner::probe::spawn_probe(&probe_exe, p, llm_burner::probe::PROBE_TIMEOUT)
-                });
-                // Fallbacks must be visible even when the TUI later owns the
-                // terminal and train.log is not being watched.
-                for note in &notes {
-                    log::warn!("{note}");
-                    println!("{note}");
-                }
+                let plan = match device {
+                    DeviceChoice::Cpu => {
+                        log::info!("backend: Flex/CPU (`--device cpu`; skipping the GPU probe)");
+                        BackendPlan::Cpu
+                    }
+                    _ => {
+                        let exe = std::env::current_exe()
+                            .context("cannot locate own executable for the GPU probe")?;
+                        let probe_exe = exe.clone();
+                        let (plan, notes) = resolve_backend_plan(precision, |p| {
+                            llm_burner::probe::spawn_probe(
+                                &probe_exe,
+                                p,
+                                llm_burner::probe::PROBE_TIMEOUT,
+                            )
+                        });
+                        // Fallbacks must be visible even when the TUI later
+                        // owns the terminal and train.log is not watched.
+                        for note in &notes {
+                            log::warn!("{note}");
+                            println!("{note}");
+                        }
+                        if plan == BackendPlan::Cpu && device == DeviceChoice::Gpu {
+                            anyhow::bail!(
+                                "`--device gpu` was requested, but no precision \
+                                 survived the GPU probe; rerun without `--device` \
+                                 to train on the CPU"
+                            );
+                        }
+                        plan
+                    }
+                };
                 match plan {
                     BackendPlan::RequestedPrecision => {
                         log::info!("backend: {}", llm_burner::train::backend_label());
@@ -301,6 +333,12 @@ env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info
             }
             #[cfg(not(feature = "gpu"))]
             {
+                if device == DeviceChoice::Gpu {
+                    anyhow::bail!(
+                        "`--device gpu` requires a GPU build; rebuild with the \
+                         default features (this binary only has the CPU backend)"
+                    );
+                }
                 log::info!("backend: {}", llm_burner::train::backend_label());
                 llm_burner::pipeline::run_pipeline_on_cpu(&inputs)?;
             }

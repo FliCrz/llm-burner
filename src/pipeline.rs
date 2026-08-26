@@ -39,6 +39,13 @@ pub struct PipelineInputs {
     pub train: TrainConfig,
     /// Optional refusal-direction ablation applied before training.
     pub ablation: Option<AblationConfig>,
+    /// Refuse to start when the estimated training footprint exceeds the
+    /// machine's available memory. Leave `true` for GPU runs (an oversized
+    /// run otherwise dies deep inside the GPU stack with cryptic panics);
+    /// callers may set `false` for explicit `--device cpu` runs, where a
+    /// shortfall surfaces as a plain allocation failure / OOM kill and the
+    /// user explicitly asked to try anyway.
+    pub memory_fit_enforced: bool,
 }
 
 /// Default download destination for a model repo: `models/<owner>--<name>`.
@@ -241,8 +248,7 @@ fn estimate_training_memory(
     let elem = elem_size as u64;
     let p = params.max(1);
     let tokens = batch_size.max(1).saturating_mul(seq_len.max(1)) as u64;
-    let per_layer =
-        16 * config.d_model as u64 + 8 * config.intermediate_size as u64;
+    let per_layer = 16 * config.d_model as u64 + 8 * config.intermediate_size as u64;
     let logits = 3 * config.vocab_size.max(1) as u64;
     TrainingMemory {
         weights: p * elem,
@@ -274,26 +280,69 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
 }
 
+/// Bytes per element for the float dtypes used as model weights.
+fn dtype_elem_size(dtype: DType) -> Option<usize> {
+    match dtype {
+        DType::F64 => Some(8),
+        DType::F32 | DType::Flex32 => Some(4),
+        DType::BF16 | DType::F16 => Some(2),
+        _ => None,
+    }
+}
+
 /// Refuse to start a fine-tune whose estimated memory footprint exceeds what
 /// the machine can currently provide. An oversized run otherwise dies deep
 /// inside the GPU stack with cryptic panics once a buffer allocation fails.
 ///
+/// `compute_elem` must describe the dtype training math runs in — on the CPU
+/// backend and the GPU f32-degradation path that is f32 even when the
+/// requested (checkpoint) precision is bf16/f16, so estimating with the
+/// requested dtype would understate the footprint by 2x.
+///
+/// When `enforced` is false an over-budget run only logs a warning and
+/// proceeds (explicit `--device cpu` runs: a shortfall there ends as a plain
+/// OOM kill instead of a driver crash).
+///
 /// Skipped silently when the model config cannot be read (the loader reports
 /// that with its own error) or `/proc/meminfo` is unavailable (non-Linux).
-fn check_memory_fit(model_dir: &Path, train: &TrainConfig) -> Result<()> {
+fn check_memory_fit(
+    model_dir: &Path,
+    train: &TrainConfig,
+    compute_elem: usize,
+    enforced: bool,
+) -> Result<()> {
     let Some(available) = available_memory_bytes() else {
         log::debug!("memory pre-flight skipped: /proc/meminfo unavailable");
         return Ok(());
     };
-    match check_memory_against(model_dir, train, available) {
+    match check_memory_against(model_dir, train, available, compute_elem) {
         Ok(()) => Ok(()),
-        Err(err) => Err(err),
+        Err(err) => apply_enforcement(err, enforced),
     }
+}
+
+/// Enforcement policy for a memory-shortfall error: strict runs fail, while
+/// explicit `--device cpu` runs log the shortfall and proceed.
+fn apply_enforcement(err: anyhow::Error, enforced: bool) -> Result<()> {
+    if enforced {
+        return Err(err);
+    }
+    log::warn!("{err}");
+    log::warn!(
+        "continuing anyway (`--device cpu`): the OS kills the run if it truly \
+         cannot fit"
+    );
+    Ok(())
 }
 
 /// [`check_memory_fit`] against a caller-supplied availability figure
 /// (testable; also the actual decision body).
-fn check_memory_against(model_dir: &Path, train: &TrainConfig, available: u64) -> Result<()> {
+fn check_memory_against(
+    model_dir: &Path,
+    train: &TrainConfig,
+    available: u64,
+    compute_elem: usize,
+) -> Result<()> {
     let Ok(transformers) = TransformersConfig::from_path(model_dir.join("config.json")) else {
         return Ok(());
     };
@@ -302,11 +351,16 @@ fn check_memory_against(model_dir: &Path, train: &TrainConfig, available: u64) -
     let estimate = |elem: usize| {
         estimate_training_memory(params, elem, train.batch_size, train.seq_len, &config)
     };
-    let est = estimate(train.precision.elem_size());
+    let est = estimate(compute_elem);
+    let compute_label = if compute_elem == train.precision.elem_size() {
+        train.precision.to_string()
+    } else {
+        format!("f32 compute for {}", train.precision)
+    };
 
     log::info!(
-        "memory pre-flight: need {} (weights {} + gradients {} + AdamW {} + \
-         activations {}; {} parameters), {} available",
+        "memory pre-flight: need {} at {compute_label} (weights {} + gradients \
+         {} + AdamW {} + activations {}; {} parameters), {} available",
         gib(est.total()),
         gib(est.weights),
         gib(est.gradients),
@@ -320,20 +374,23 @@ fn check_memory_against(model_dir: &Path, train: &TrainConfig, available: u64) -
         return Ok(());
     }
 
-    let remedy = if train.precision == Precision::F32 {
+    // Suggesting `--precision bf16` only helps when compute follows the
+    // requested precision; on degraded-f32 paths it would change nothing.
+    let remedy = if compute_elem == Precision::F32.elem_size() && train.precision == Precision::F32
+    {
         format!(
             "Try `--precision bf16` (estimated {}), or lower `--batch-size` / `--seq-len`",
             gib(estimate(Precision::Bf16.elem_size()).total())
         )
     } else {
-        "Try lowering `--batch-size` / `--seq-len`".to_string()
+        "Try lowering `--batch-size` / `--seq-len`, or pass `--device cpu`".to_string()
     };
     bail!(
         "not enough memory to fine-tune `{}` in {}: estimated {} \
          (weights {} + gradients {} + AdamW state {} + activations {} at \
          batch {} x seq_len {}), but only {} is currently available. {remedy}",
         model_dir.display(),
-        train.precision,
+        compute_label,
         gib(est.total()),
         gib(est.weights),
         gib(est.gradients),
@@ -391,8 +448,17 @@ where
     Autodiff<B>: burn::tensor::backend::AutodiffBackend<InnerBackend = B>,
     f32: From<<Autodiff<B> as burn::tensor::backend::BackendTypes>::FloatElem>,
 {
-    // Fail fast (before allocating weights) when this run cannot fit.
-    check_memory_fit(&inputs.model_dir, &inputs.train)?;
+    // Fail fast (before allocating weights) when this run cannot fit. The
+    // estimate must follow the compute dtype (`load_dtype`), not the
+    // checkpoint precision: degraded runs train in f32 while loading bf16.
+    let compute_elem = dtype_elem_size(load_dtype)
+        .with_context(|| format!("unsupported weight dtype {load_dtype:?}"))?;
+    check_memory_fit(
+        &inputs.model_dir,
+        &inputs.train,
+        compute_elem,
+        inputs.memory_fit_enforced,
+    )?;
 
     log::info!(
         "loading model from `{}` as {}",
@@ -482,6 +548,92 @@ where
 mod tests {
     use super::*;
     use burn_store::ModuleSnapshot;
+
+    // ---------- memory pre-flight ----------
+
+    /// Minimal llama-style `config.json` matching [`LlmModelConfig::tiny`].
+    fn write_tiny_config(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "model_type": "llama",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "num_hidden_layers": 2,
+                "vocab_size": 256,
+                "max_position_embeddings": 64,
+                "tie_word_embeddings": false
+            }"#,
+        )
+        .unwrap();
+    }
+
+    fn bf16_train_cfg() -> TrainConfig {
+        TrainConfig {
+            steps: 1,
+            batch_size: 1,
+            seq_len: 16,
+            precision: Precision::Bf16,
+            ..TrainConfig::default()
+        }
+    }
+
+    /// A bf16 request on an f32-computing backend (CPU fallback, degraded
+    /// GPU) must be sized at 4 bytes/element — the old behavior estimated
+    /// with the checkpoint dtype and understated the footprint by 2x.
+    #[test]
+    fn memory_preflight_sizes_degraded_runs_at_compute_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_config(dir.path());
+
+        let transformers = TransformersConfig::from_path(dir.path().join("config.json")).unwrap();
+        let config = LlmModelConfig::from_transformers(&transformers);
+        let params = config.param_count();
+        let total = |elem: usize| estimate_training_memory(params, elem, 1, 16, &config).total();
+        let bf16_total = total(2);
+        let f32_total = total(4);
+        assert!(f32_total > bf16_total);
+
+        // Budget between the two estimates: honest bf16 compute fits,
+        // f32 compute does not.
+        let budget = bf16_total + (f32_total - bf16_total) / 2;
+        let train = bf16_train_cfg();
+
+        assert!(check_memory_against(dir.path(), &train, budget, 2).is_ok());
+
+        let err = check_memory_against(dir.path(), &train, budget, 4).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("f32 compute for bf16"),
+            "error should name the real compute dtype: {msg}"
+        );
+        assert!(
+            msg.contains("--device cpu"),
+            "error should suggest --device cpu: {msg}"
+        );
+        // The old wording claimed the run was "in bf16"; it must not lie.
+        assert!(
+            !msg.contains("in bf16:"),
+            "error must not claim bf16 compute: {msg}"
+        );
+    }
+
+    #[test]
+    fn forced_cpu_downgrades_shortfall_to_warning() {
+        let make_err = || anyhow::anyhow!("synthetic shortfall");
+        assert!(apply_enforcement(make_err(), true).is_err());
+        assert!(apply_enforcement(make_err(), false).is_ok());
+    }
+
+    #[test]
+    fn memory_preflight_skips_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // No config.json at all: the loader reports that later; here no-op.
+        assert!(check_memory_against(dir.path(), &bf16_train_cfg(), 0, 4).is_ok());
+    }
 
     // ---------- output naming ----------
 

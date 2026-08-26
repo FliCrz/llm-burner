@@ -9,6 +9,10 @@
 //! degrade gracefully if the child dies — first to f32 compute on the same
 //! GPU (checkpoints keep the requested precision), then to CPU training
 //! ([`resolve_backend_plan`]).
+//!
+//! [`DeviceChoice`] lets the caller steer that ladder from the CLI
+//! (`--device`): `auto` probes as described, `cpu` skips probing entirely,
+//! and `gpu` refuses to fall back to the CPU backend.
 
 use std::io::Read;
 use std::path::Path;
@@ -46,6 +50,45 @@ impl std::fmt::Display for ProbeOutcome {
             Self::Success => write!(f, "success"),
             Self::TimedOut => write!(f, "timed out after {}s", PROBE_TIMEOUT.as_secs()),
             Self::Failed { detail } => write!(f, "failed: {detail}"),
+        }
+    }
+}
+
+/// Which device a training run should target (`--device`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeviceChoice {
+    /// Probe the GPU and degrade along the ladder, ending on the CPU backend
+    /// only when no dtype survives.
+    #[default]
+    Auto,
+    /// Force the CPU backend: skip GPU probing entirely.
+    Cpu,
+    /// Require the GPU backend: fail loudly instead of silently falling back
+    /// to CPU when no dtype survives the probe.
+    Gpu,
+}
+
+impl std::fmt::Display for DeviceChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Cpu => write!(f, "cpu"),
+            Self::Gpu => write!(f, "gpu"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeviceChoice {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            _ => Err(anyhow::anyhow!(
+                "unknown device `{s}` (expected auto, cpu, or gpu)"
+            )),
         }
     }
 }
@@ -341,5 +384,28 @@ mod tests {
         assert_eq!(probed, vec![Precision::F32]);
         assert_eq!(plan, BackendPlan::Cpu);
         assert!(notes.iter().all(|n| !n.contains("either")));
+    }
+
+    // ---------- device choice parsing ----------
+
+    #[test]
+    fn device_choice_parses_case_insensitively() {
+        use std::str::FromStr;
+        for (raw, want) in [
+            ("auto", DeviceChoice::Auto),
+            ("AUTO", DeviceChoice::Auto),
+            ("cpu", DeviceChoice::Cpu),
+            ("CPU", DeviceChoice::Cpu),
+            ("gpu", DeviceChoice::Gpu),
+            ("GPU", DeviceChoice::Gpu),
+        ] {
+            assert_eq!(
+                DeviceChoice::from_str(raw).unwrap(),
+                want,
+                "wrong parse for `{raw}`"
+            );
+        }
+        assert!(DeviceChoice::from_str("tpu").is_err());
+        assert_eq!(DeviceChoice::default(), DeviceChoice::Auto);
     }
 }
