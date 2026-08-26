@@ -290,10 +290,10 @@ fn dtype_elem_size(dtype: DType) -> Option<usize> {
     }
 }
 
-/// Refuse to start a fine-tune whose estimated memory footprint exceeds what
-/// the machine can currently provide. An oversized run otherwise dies deep
-/// inside the GPU stack with cryptic panics once a buffer allocation fails.
-///
+/// Refuse to start a fine-tune whose estimated *system* memory footprint exceeds what
+/// the OS reports as available (`/proc/meminfo`'s `MemAvailable`). On iGPUs/unified
+/// memory this often correlates with GPU OOMs; on discrete GPUs it may be overly
+/// strict or fail to predict VRAM exhaustion.
 /// `compute_elem` must describe the dtype training math runs in — on the CPU
 /// backend and the GPU f32-degradation path that is f32 even when the
 /// requested (checkpoint) precision is bf16/f16, so estimating with the
