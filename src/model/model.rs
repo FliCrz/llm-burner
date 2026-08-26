@@ -97,8 +97,7 @@ impl LlmModelConfig {
     /// Mirrors [`Transformer::new`] / [`LlmModel::new`] exactly (projection
     /// shapes, optional QKV biases, optional Q/K norms, tied embeddings) so
     /// callers can size a run — e.g. the memory pre-flight in the pipeline —
-    /// without building the model. Verified against a real instantiation in
-    /// the unit tests.
+    /// without building the model. Keep this in sync with model construction.
     pub fn param_count(&self) -> u64 {
         let d = self.d_model as u64;
         let q_out = (self.n_heads * self.head_dim) as u64;
