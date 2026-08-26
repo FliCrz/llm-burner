@@ -37,9 +37,22 @@ numerically fragile). On `flex` builds only f32 is available.
 > `libvulkan_radeon.so` while compiling cubecl's bf16 compute pipelines (bf16 is
 > emulated through bit-manipulation SPIR-V that trips this driver). `--precision f16`
 > works — WGSL supports it natively. Revisit bf16 after a Mesa upgrade.
+> Pass `--device cpu` to skip GPU probing altogether (note: degraded runs compute
+> in f32, so a 3B model needs ~48 GiB for weights + gradients + AdamW state).
 
 Use `--no-tui` to skip the Ratatui dashboard (tests, CI, non-interactive runs);
 progress goes to the log file only.
+
+`--device auto|cpu|gpu` (default `auto`) picks where training runs:
+* `auto` probes the GPU out-of-process and degrades along the ladder
+  *requested precision → f32 compute on the GPU → CPU*.
+* `cpu` forces the CPU backend and skips probing entirely — useful when a
+  driver crashes during probing or you want deterministic behavior. On CPU,
+  compute is always f32 (the requested precision applies to checkpoint load
+  and export), and the memory pre-flight downgrades to a warning if the
+  estimated footprint does not fit.
+* `gpu` requires the GPU backend: if no dtype survives the probe the run
+  fails instead of silently falling back to CPU.
 
 While training runs, raw stdout/stderr are redirected into `train.log` so cubecl/wgpu
 compile diagnostics cannot garble the Ratatui dashboard; everything lands in

@@ -65,10 +65,11 @@ use burn::train::{Learner, LearningComponentsMarker};
 ///
 /// On GPU builds the requested dtype drives the whole stack (checkpoint load,
 /// forward/backward math, optimizer state, export). If the GPU probe rejects
-/// the dtype (buggy driver), or on CPU-only builds, training computes in f32
-/// while the checkpoint load/export still honor the requested dtype — fp32
-/// master weights are also the numerically safer recipe for half-precision
-/// AdamW.
+/// the dtype (buggy driver), training degrades to f32 compute *on the GPU*
+/// first and only falls back to CPU when no dtype survives; on CPU-only
+/// builds everything computes in f32. In both degraded modes the checkpoint
+/// load/export still honor the requested dtype — fp32 master weights are
+/// also the numerically safer recipe for half-precision AdamW.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Precision {
     /// Full 32-bit floating point.
@@ -111,6 +112,14 @@ impl Precision {
             Precision::F32 => DType::F32,
             Precision::Bf16 => DType::BF16,
             Precision::F16 => DType::F16,
+        }
+    }
+
+    /// Size in bytes of one element of this dtype.
+    pub fn elem_size(self) -> usize {
+        match self {
+            Precision::F32 => 4,
+            Precision::Bf16 | Precision::F16 => 2,
         }
     }
 }
