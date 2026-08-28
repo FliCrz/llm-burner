@@ -151,7 +151,9 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
     // never produces an `output.weight`. llama.cpp would fall back to using
     // `token_embd` as the output projection, but that fallback yields garbage
     // output in practice — the official HF converter duplicates the embedding
-    // matrix into `output.weight`, and so do we.
+    // matrix into `output.weight`, and so do we. Detect this from the actual
+    // model parameters rather than config, since config may be stale.
+    let has_lm_head = snapshots.iter().any(|s| s.full_path() == "lm_head.weight");
     let mut tied_output: Option<(Vec<usize>, GgmlType, Vec<u8>)> = None;
 
     for snapshot in &snapshots {
@@ -225,7 +227,7 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
         let bytes = quantize(&floats, dtype)
             .map_err(|e| anyhow::anyhow!("failed to quantize `{gguf_name}` with {dtype:?}: {e}"))?;
 
-        if gguf_name == "token_embd.weight" && config.tie_word_embeddings {
+        if gguf_name == "token_embd.weight" && !has_lm_head {
             tied_output = Some((shape_vec.clone(), dtype, bytes.clone()));
         }
         writer
