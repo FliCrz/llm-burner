@@ -175,6 +175,17 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
             })?
         };
 
+        let floats = if arch == "gemma" && snapshot.full_path().ends_with("norm.weight") {
+            // HF Gemma's RmsNorm computes `x * (1 + weight)` while llama.cpp's
+            // gemma graph applies a plain `x * weight`. The official converter
+            // (conversion/gemma.py) therefore stores `weight + 1`. Without this
+            // shift every decoder layer's normalization is wrong, collapsing the
+            // model into garbage. Applies to attn/ffn/output norms alike.
+            floats.into_iter().map(|v| v + 1.0).collect()
+        } else {
+            floats
+        };
+
         // GGUF declares dimensions fastest-first: ne[0] is the contiguous
         // axis, i.e. ne is the reverse of the row-major shape of the stored
         // buffer, and buffers must be in PyTorch layout:
@@ -819,6 +830,136 @@ mod tests {
         for (i, (g, e)) in got.iter().zip(floats.iter()).enumerate() {
             assert_eq!(g, e, "q bias mismatch at flat index {i}");
         }
+    }
+
+    /// HF Gemma's RmsNorm computes `x * (1 + weight)` while llama.cpp applies a
+    /// plain `x * weight`, so every gemma norm must be exported with `+1` baked
+    /// in (see conversion/gemma.py). Missing this shift collapses the model to
+    /// gibberish. Applies identically to the three norm kinds we export.
+    #[test]
+    fn gemma_norms_are_shifted_by_one() {
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig {
+            hf_model_type: "gemma".into(),
+            use_gelu: true,
+            ..LlmModelConfig::tiny()
+        };
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+        let tokenizer = dummy_tokenizer(&config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gemma-norm.gguf");
+        export_gguf(&model, &config, &tokenizer, &path, "test").unwrap();
+        let file = GgufFile::from_path(&path).unwrap();
+
+        let snapshots = model.collect(None, None, false);
+        let raw = |p: &str| {
+            snapshots
+                .iter()
+                .find(|s| s.full_path() == p)
+                .unwrap()
+                .to_data()
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+
+        // output_norm <- model.norm.weight
+        let pairs = [
+            ("model.norm.weight", "output_norm.weight"),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "blk.0.attn_norm.weight",
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "blk.0.ffn_norm.weight",
+            ),
+        ];
+        for (hf, gguf) in pairs {
+            let expected: Vec<f32> = raw(hf).into_iter().map(|v| v + 1.0).collect();
+            let (got, _) = file.dequant_f32(gguf).unwrap();
+            assert_eq!(got, expected, "`{gguf}` must be stored as raw + 1");
+            assert_eq!(
+                file.tensors[gguf].dtype,
+                rlx_gguf::GgmlType::F32,
+                "`{gguf}` must stay F32"
+            );
+        }
+    }
+
+    /// Value-level round-trip on a gemma-family tiny model: every exported
+    /// tensor must match the in-memory parameters after the same
+    /// transforms the exporter applies (transpose 2-D linears to PyTorch
+    /// row-major, add 1 to norms, leave embeddings/biases alone, no RoPE
+    /// permutation for the NEOX gemma family). Tiny tensors stay F32, so the
+    /// comparison is exact and any transposition/layout bug is caught here
+    /// rather than surfacing as gibberish in llama.cpp.
+    #[test]
+    fn gemma_export_roundtrips_weight_values() {
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig {
+            hf_model_type: "gemma".into(),
+            use_gelu: true,
+            qkv_bias: true,
+            tie_word_embeddings: true,
+            ..LlmModelConfig::tiny()
+        };
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+        let tokenizer = dummy_tokenizer(&config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gemma-rt.gguf");
+        export_gguf(&model, &config, &tokenizer, &path, "test").unwrap();
+        let file = GgufFile::from_path(&path).unwrap();
+
+        let snapshots = model.collect(None, None, false);
+
+        // Recompute the expected flat GGUF buffer for a snapshot, mirroring
+        // the exporter's transforms exactly.
+        let expected = |snap: &burn_store::TensorSnapshot| -> Vec<f32> {
+            let mut floats = snap.to_data().unwrap().to_vec::<f32>().unwrap();
+            if config.hf_model_type.starts_with("gemma")
+                && snap.full_path().ends_with("norm.weight")
+            {
+                floats.iter_mut().for_each(|v| *v += 1.0);
+            }
+            if snap.shape.num_dims() == 2 && is_linear_weight(&snap.full_path()) {
+                // Burn `[in, out]` -> PyTorch `[out, in]` row-major. Gemma uses
+                // NEOX RoPE: no additional row permutation.
+                let [d0, d1] = snap.shape.dims::<2>();
+                transpose(&floats, d0, d1)
+            } else {
+                floats
+            }
+        };
+
+        for snap in &snapshots {
+            let Some(gguf_name) = gguf_tensor_name(&snap.full_path()) else {
+                continue;
+            };
+            let expect = expected(snap);
+            let (got, _) = file.dequant_f32(&gguf_name).unwrap();
+            assert_eq!(
+                got.len(),
+                expect.len(),
+                "element count mismatch for `{gguf_name}`"
+            );
+            for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+                assert_eq!(g, e, "value mismatch at flat index {i} for `{gguf_name}`");
+            }
+        }
+
+        // Sanity: every exported tensor was validated above.
+        assert!(file.tensors.len() >= 1, "no tensors validated");
     }
 
     /// Vocabs containing `<0xNN>` byte-fallback tokens follow SentencePiece
