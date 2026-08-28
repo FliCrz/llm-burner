@@ -151,6 +151,11 @@ enum Command {
         /// Model name string recorded in GGUF metadata.
         #[arg(long, default_value = "llm-burner-finetune")]
         model_name: String,
+
+        /// Device backend: `auto` uses GPU if available, `cpu` forces the
+        /// CPU backend.
+        #[arg(long, default_value_t = DeviceChoice::Auto)]
+        device: DeviceChoice,
     },
 }
 
@@ -353,9 +358,9 @@ fn main() -> anyhow::Result<()> {
             model_dir,
             output,
             model_name,
+            device,
         } => {
             init_stderr_logger();
-            // Load config from the model directory
             let config_path = model_dir.join("config.json");
             if !config_path.exists() {
                 anyhow::bail!("`config.json` not found in `{}`", model_dir.display());
@@ -364,14 +369,12 @@ fn main() -> anyhow::Result<()> {
                 .context(format!("failed to parse `{}`", config_path.display()))?;
             let config = llm_burner::model::LlmModelConfig::from_transformers(&transformers);
 
-            // Load tokenizer
             let tokenizer_path = model_dir.join("tokenizer.json");
             if !tokenizer_path.exists() {
                 anyhow::bail!("`tokenizer.json` not found in `{}`", model_dir.display());
             }
             let tokenizer = llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?;
 
-            // Load model weights
             let shards = llm_burner::hf::classify_download(&model_dir)?;
             let shards_refs: Vec<&std::path::Path> =
                 shards.safetensors.iter().map(PathBuf::as_path).collect();
@@ -382,23 +385,66 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let mut model = llm_burner::model::LlmModel::<llm_burner::train::InferBackend>::new(
-                &config,
-                &Default::default(),
-            );
-            llm_burner::model::load::load_from_safetensors(
-                &mut model,
-                &shards_refs,
-                burn::tensor::DType::F32,
-            )?;
-
-            // Export to GGUF
             let gguf_parent = output.parent().map(|p| p.to_path_buf()).unwrap_or_default();
             std::fs::create_dir_all(&gguf_parent)?;
-            let gguf_path = output;
-            llm_burner::export::export_gguf(&model, &config, &tokenizer, &gguf_path, &model_name)?;
 
-            log::info!("exported GGUF to {}", gguf_path.display());
+            #[cfg(feature = "gpu")]
+            match device {
+                DeviceChoice::Cpu => {
+                    let mut model = llm_burner::model::LlmModel::<
+                        burn::backend::Flex<f32, i32>,
+                    >::new(&config, &burn::backend::flex::FlexDevice);
+                    llm_burner::model::load::load_from_safetensors(
+                        &mut model,
+                        &shards_refs,
+                        burn::tensor::DType::F32,
+                    )?;
+                    llm_burner::export::export_gguf(
+                        &model,
+                        &config,
+                        &tokenizer,
+                        &output,
+                        &model_name,
+                    )?;
+                }
+                _ => {
+                    let mut model = llm_burner::model::LlmModel::<
+                        llm_burner::train::InferBackend,
+                    >::new(&config, &Default::default());
+                    llm_burner::model::load::load_from_safetensors(
+                        &mut model,
+                        &shards_refs,
+                        burn::tensor::DType::F32,
+                    )?;
+                    llm_burner::export::export_gguf(
+                        &model,
+                        &config,
+                        &tokenizer,
+                        &output,
+                        &model_name,
+                    )?;
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                let mut model = llm_burner::model::LlmModel::<
+                    llm_burner::train::InferBackend,
+                >::new(&config, &burn::backend::flex::FlexDevice);
+                llm_burner::model::load::load_from_safetensors(
+                    &mut model,
+                    &shards_refs,
+                    burn::tensor::DType::F32,
+                )?;
+                llm_burner::export::export_gguf(
+                    &model,
+                    &config,
+                    &tokenizer,
+                    &output,
+                    &model_name,
+                )?;
+            }
+
+            log::info!("exported GGUF to {}", output.display());
         }
     }
     Ok(())
