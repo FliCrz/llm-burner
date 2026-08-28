@@ -240,6 +240,36 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
         writer
             .add_tensor_bytes("output.weight".to_string(), shape, dtype, bytes)
             .context("failed to add tensor `output.weight`")?;
+    } else if !has_lm_head {
+        // Safety net: tied model but token_embd was somehow not captured.
+        // Re-scan snapshots to find it. This should never fire in practice
+        // but protects against mismatched configs or unexpected collect
+        // ordering.
+        log::warn!("tied model has no output.weight; falling back to token_embd scan");
+        for snapshot in &snapshots {
+            if snapshot.full_path() == "model.embed_tokens.weight" {
+                let shape_vec = snapshot.shape.to_vec();
+                let data = snapshot.to_data().map_err(|e| {
+                    anyhow::anyhow!("failed to read token_embd: {e}")
+                })?;
+                let floats = if data.dtype == burn::tensor::DType::F32 {
+                    data.to_vec::<f32>().map_err(|e| {
+                        anyhow::anyhow!("failed to read token_embd as f32: {e}")
+                    })?
+                } else {
+                    data.convert_dtype(burn::tensor::DType::F32).to_vec::<f32>().map_err(|e| {
+                        anyhow::anyhow!("failed to read token_embd as f32: {e}")
+                    })?
+                };
+                let dtype = QUANT_DTYPE;
+                let bytes = quantize(&floats, dtype)
+                    .map_err(|e| anyhow::anyhow!("failed to quantize output.weight: {e}"))?;
+                writer
+                    .add_tensor_bytes("output.weight".to_string(), shape_vec, dtype, bytes)
+                    .context("failed to add tensor `output.weight`")?;
+                break;
+            }
+        }
     }
 
     writer
