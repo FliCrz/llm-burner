@@ -184,6 +184,13 @@ impl<B: Backend> Transformer<B> {
             })
             .init(device);
 
+        // Gemma's RmsNorm computes `x * (1 + weight)`, so the hidden norms are
+        // exported with a baked-in +1 (see export_gguf). Training must use the
+        // same `1 + weight` form, otherwise the trained gains are tuned for a
+        // plain `x * weight` graph and the exported +1 makes llama.cpp apply a
+        // norm the optimizer never saw, collapsing output to a repetition loop.
+        let is_gemma = config.gguf_architecture() == "gemma";
+
         let layers = (0..config.n_layers)
             .map(|_| {
                 let self_attn = super::attention::CausalAttention::new(
@@ -204,8 +211,13 @@ impl<B: Backend> Transformer<B> {
                     config.use_gelu,
                     device,
                 );
-                let input_layernorm = RmsNorm::new(config.d_model, config.rms_eps, device);
-                let post_attention_layernorm = RmsNorm::new(config.d_model, config.rms_eps, device);
+                let mut input_layernorm = RmsNorm::new(config.d_model, config.rms_eps, device);
+                let mut post_attention_layernorm =
+                    RmsNorm::new(config.d_model, config.rms_eps, device);
+                if is_gemma {
+                    input_layernorm = input_layernorm.with_unit_offset();
+                    post_attention_layernorm = post_attention_layernorm.with_unit_offset();
+                }
                 DecoderLayer {
                     self_attn,
                     mlp,
@@ -215,7 +227,10 @@ impl<B: Backend> Transformer<B> {
             })
             .collect();
 
-        let norm = RmsNorm::new(config.d_model, config.rms_eps, device);
+        let mut norm = RmsNorm::new(config.d_model, config.rms_eps, device);
+        if is_gemma {
+            norm = norm.with_unit_offset();
+        }
 
         Self {
             embed_tokens,
