@@ -147,15 +147,6 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
     let pre = if arch == "qwen2" { Some("qwen2") } else { None };
     add_tokenizer_metadata(&mut writer, tokenizer, config.vocab_size, pre);
 
-    // Tied-embedding models have no `lm_head` parameter, so the loop below
-    // never produces an `output.weight`. llama.cpp would fall back to using
-    // `token_embd` as the output projection, but that fallback yields garbage
-    // output in practice — the official HF converter duplicates the embedding
-    // matrix into `output.weight`, and so do we. Detect this from the actual
-    // model parameters rather than config, since config may be stale.
-    let has_lm_head = snapshots.iter().any(|s| s.full_path() == "lm_head.weight");
-    let mut tied_output: Option<(Vec<usize>, GgmlType, Vec<u8>)> = None;
-
     for snapshot in &snapshots {
         let Some(gguf_name) = gguf_tensor_name(&snapshot.full_path()) else {
             log::warn!("skipping untranslated tensor `{}`", snapshot.full_path());
@@ -227,49 +218,9 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
         let bytes = quantize(&floats, dtype)
             .map_err(|e| anyhow::anyhow!("failed to quantize `{gguf_name}` with {dtype:?}: {e}"))?;
 
-        if gguf_name == "token_embd.weight" && !has_lm_head {
-            tied_output = Some((shape_vec.clone(), dtype, bytes.clone()));
-        }
         writer
             .add_tensor_bytes(gguf_name.clone(), shape_vec, dtype, bytes)
             .with_context(|| format!("failed to add tensor `{gguf_name}`"))?;
-    }
-
-    if let Some((shape, dtype, bytes)) = tied_output {
-        log::info!("tied embeddings: writing token_embd matrix as output.weight for llama.cpp");
-        writer
-            .add_tensor_bytes("output.weight".to_string(), shape, dtype, bytes)
-            .context("failed to add tensor `output.weight`")?;
-    } else if !has_lm_head {
-        // Safety net: tied model but token_embd was somehow not captured.
-        // Re-scan snapshots to find it. This should never fire in practice
-        // but protects against mismatched configs or unexpected collect
-        // ordering.
-        log::warn!("tied model has no output.weight; falling back to token_embd scan");
-        for snapshot in &snapshots {
-            if snapshot.full_path() == "model.embed_tokens.weight" {
-                let shape_vec = snapshot.shape.to_vec();
-                let data = snapshot.to_data().map_err(|e| {
-                    anyhow::anyhow!("failed to read token_embd: {e}")
-                })?;
-                let floats = if data.dtype == burn::tensor::DType::F32 {
-                    data.to_vec::<f32>().map_err(|e| {
-                        anyhow::anyhow!("failed to read token_embd as f32: {e}")
-                    })?
-                } else {
-                    data.convert_dtype(burn::tensor::DType::F32).to_vec::<f32>().map_err(|e| {
-                        anyhow::anyhow!("failed to read token_embd as f32: {e}")
-                    })?
-                };
-                let dtype = QUANT_DTYPE;
-                let bytes = quantize(&floats, dtype)
-                    .map_err(|e| anyhow::anyhow!("failed to quantize output.weight: {e}"))?;
-                writer
-                    .add_tensor_bytes("output.weight".to_string(), shape_vec, dtype, bytes)
-                    .context("failed to add tensor `output.weight`")?;
-                break;
-            }
-        }
     }
 
     writer
@@ -782,10 +733,12 @@ mod tests {
     }
 
     /// Tied-embedding models (Qwen2.5, Gemma) have no `lm_head` parameter, so
-    /// without special handling no `output.weight` reaches the GGUF. llama.cpp
-    /// then falls back to using `token_embd` as the output projection — which
-    /// produces garbage output. The exporter must duplicate the embedding
-    /// matrix into an explicit `output.weight` tensor.
+    /// no `output.weight` is written. llama.cpp's architecture loaders treat
+    /// the output projection as duplicated from `token_embd` for tied models
+    /// (e.g. gemma always, llama when `tie_word_embeddings` is set), so
+    /// writing an extra `output.weight` would push the tensor count one above
+    /// what llama.cpp expects and fail to load. The exporter must therefore
+    /// leave `token_embd.weight` to serve both roles.
     #[test]
     fn tied_embeddings_export_output_weight() {
         use crate::model::LlmModelConfig;
@@ -813,23 +766,13 @@ mod tests {
         let file = GgufFile::from_path(&path).unwrap();
 
         assert!(file.tensors.contains_key("token_embd.weight"));
-        assert!(file.tensors.contains_key("output.weight"));
-        assert_eq!(
-            file.tensors["output.weight"].shape,
-            vec![config.d_model, config.vocab_size]
+        // Tied models must NOT emit a separate output.weight: llama.cpp
+        // duplicates the output from token_embd and would reject the extra
+        // tensor with a wrong-tensor-count error.
+        assert!(
+            !file.tensors.contains_key("output.weight"),
+            "tied model must not emit a separate output.weight"
         );
-        assert_eq!(
-            file.tensors["output.weight"].dtype,
-            file.tensors["token_embd.weight"].dtype
-        );
-
-        // The output projection must be a copy of the embedding matrix.
-        let (embd, _) = file.dequant_f32("token_embd.weight").unwrap();
-        let (out, _) = file.dequant_f32("output.weight").unwrap();
-        assert_eq!(embd.len(), out.len());
-        for (i, (a, b)) in embd.iter().zip(out.iter()).enumerate() {
-            assert_eq!(a, b, "output.weight differs from token_embd at {i}");
-        }
     }
 
     /// Qwen2-style checkpoints train non-zero attention QKV biases. They must
