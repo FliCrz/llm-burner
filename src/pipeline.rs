@@ -254,7 +254,11 @@ fn estimate_training_memory(
         weights: p * elem,
         gradients: p * elem,
         optimizer: 2 * p * elem,
-        activations: tokens.saturating_mul(elem).saturating_mul(per_layer.saturating_mul(config.n_layers as u64).saturating_add(logits)),
+        activations: tokens.saturating_mul(elem).saturating_mul(
+            per_layer
+                .saturating_mul(config.n_layers as u64)
+                .saturating_add(logits),
+        ),
     }
 }
 
@@ -262,7 +266,7 @@ fn estimate_training_memory(
 fn parse_mem_available(meminfo: &str) -> Option<u64> {
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb.saturating_mul(1024));
         }
     }

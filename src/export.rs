@@ -959,7 +959,7 @@ mod tests {
         }
 
         // Sanity: every exported tensor was validated above.
-        assert!(file.tensors.len() >= 1, "no tensors validated");
+        assert!(!file.tensors.is_empty(), "no tensors validated");
     }
 
     /// Vocabs containing `<0xNN>` byte-fallback tokens follow SentencePiece

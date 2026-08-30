@@ -1,18 +1,18 @@
 //! Dump exact leading values + std of key tensors after load, for comparison
 //! against direct safetensors reads.
-use std::path::Path;
-use burn::tensor::{DType};
+use burn::tensor::DType;
 use burn_store::ModuleSnapshot;
 use llm_burner::config::TransformersConfig;
 use llm_burner::data::TokenizerStore;
 use llm_burner::model::load::load_from_safetensors;
 use llm_burner::model::{LlmModel, LlmModelConfig};
+use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
     type B = burn::backend::Flex<f32, i32>;
     let dir_arg = std::env::args().nth(1).expect("model_dir");
     let dir = Path::new(&dir_arg);
-    let cfg = TransformersConfig::from_path(&dir.join("config.json"))?;
+    let cfg = TransformersConfig::from_path(dir.join("config.json"))?;
     let config = LlmModelConfig::from_transformers(&cfg);
     let _tokenizer = TokenizerStore::from_file(&dir.join("tokenizer.json"))?;
     let shards = llm_burner::hf::classify_download(dir)?.safetensors;
@@ -40,12 +40,16 @@ fn main() -> anyhow::Result<()> {
         } else {
             data.convert_dtype(DType::F32)
         };
-        let data = &data2;
         let v: Vec<f32> = data2.to_vec()?;
         let n = v.len() as f32;
         let mean = v.iter().sum::<f32>() / n;
         let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n;
-        println!("{name}: dtype={dt:?} std={:.4} mean={:.5} first6={:?}", var.sqrt(), mean, &v[..v.len().min(6)]);
+        println!(
+            "{name}: dtype={dt:?} std={:.4} mean={:.5} first6={:?}",
+            var.sqrt(),
+            mean,
+            &v[..v.len().min(6)]
+        );
     }
     // Row-level embed audit.
     let data = model.model.embed_tokens.weight.val().to_data();
@@ -58,10 +62,22 @@ fn main() -> anyhow::Result<()> {
     let v = data2.to_vec()?;
     let (rows, cols) = (151936usize, 896usize);
     assert_eq!(v.len(), rows * cols);
-    let norm = |r: usize| v[r * cols..(r + 1) * cols].iter().map(|x: &f32| x * x).sum::<f32>().sqrt();
+    let norm = |r: usize| {
+        v[r * cols..(r + 1) * cols]
+            .iter()
+            .map(|x: &f32| x * x)
+            .sum::<f32>()
+            .sqrt()
+    };
     println!("[embed] dims ok, first3={:?}", &v[..3]);
-    for r in [0usize, 1, 100, 50000, 151000, 151664, 151665, 151900, 151935] {
-        println!("[embed] row {r}: norm={:.4} first3={:?}", norm(r), &v[r * cols..r * cols + 3]);
+    for r in [
+        0usize, 1, 100, 50000, 151000, 151664, 151665, 151900, 151935,
+    ] {
+        println!(
+            "[embed] row {r}: norm={:.4} first3={:?}",
+            norm(r),
+            &v[r * cols..r * cols + 3]
+        );
     }
     Ok(())
 }

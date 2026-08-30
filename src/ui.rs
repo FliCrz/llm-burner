@@ -330,16 +330,10 @@ fn draw(frame: &mut Frame<'_>, state: &State) {
         header.push(Line::from(vec![
             Span::raw(" "),
             Span::styled("model ", Style::new().fg(Color::Gray)),
-            Span::styled(
-                state.run_info.model.clone(),
-                Style::new().fg(Color::Cyan),
-            ),
+            Span::styled(state.run_info.model.clone(), Style::new().fg(Color::Cyan)),
             Span::raw("  "),
             Span::styled("dataset ", Style::new().fg(Color::Gray)),
-            Span::styled(
-                state.run_info.dataset.clone(),
-                Style::new().fg(Color::Cyan),
-            ),
+            Span::styled(state.run_info.dataset.clone(), Style::new().fg(Color::Cyan)),
         ]));
     }
 

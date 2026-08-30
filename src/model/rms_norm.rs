@@ -97,7 +97,11 @@ mod tests {
         for i in 0..3 {
             let xn = xv[i] / rms;
             let e = xn * w[i];
-            assert!((out[i] - e).abs() < 1e-5, "plain: got {}, expected {e}", out[i]);
+            assert!(
+                (out[i] - e).abs() < 1e-5,
+                "plain: got {}, expected {e}",
+                out[i]
+            );
         }
     }
 }
