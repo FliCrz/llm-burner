@@ -190,6 +190,19 @@ impl<B: Backend> CausalAttention<B> {
         start_pos: usize,
     ) -> Tensor<B, 3> {
         let [batch, seq, _hidden] = hidden.dims();
+        if let Some(layer_kv) = cache.as_ref() {
+            if !layer_kv.is_empty() {
+                assert_eq!(
+                    seq, 1,
+                    "warm-cache decode assumes single-token steps; use prefill for seq > 1"
+                );
+                assert_eq!(
+                    start_pos,
+                    layer_kv.len(),
+                    "warm-cache decode starts at cache.len()"
+                );
+            }
+        }
         let device = &hidden.device();
 
         let q = self.q_proj.forward(hidden.clone());

@@ -274,16 +274,22 @@ fn row_bytes(dt: GgmlType, cols: usize) -> usize {
 /// fixed-point dot on every second large matrix (up to q/k/v/o + gate/up/down,
 /// 7 GEMVs per layer); everything else walks the packed rows with the
 /// block-dequant dot.
-fn gemv(m: &MatRef, x: &[f32], out: &mut [f32], scratch: &mut [f32; QK_K]) {
+fn gemv(
+    m: &MatRef,
+    x: &[f32],
+    out: &mut [f32],
+    scratch: &mut [f32; QK_K],
+    q8_buf: &mut Vec<u8>,
+) -> Result<()> {
     debug_assert_eq!(x.len(), m.cols);
     debug_assert_eq!(out.len(), m.rows);
     let dt = m.dtype();
-    let bytes = m.bytes().unwrap_or_else(|e| panic!("{e}"));
+    let bytes = m.bytes().with_context(|| format!("failed to read tensor `{}`", m.name))?;
     if dt == GgmlType::Q4K && cols_q4k_aligned(m.cols) {
         let blocks = m.cols / QK_K;
         let row_len = blocks * Q4K_BLOCK_BYTES;
-        let mut q8 = vec![0u8; blocks * Q8K_BLOCK_BYTES];
-        quantize_q8_k_row(x, q8.as_mut_slice());
+        q8_buf.resize(blocks * Q8K_BLOCK_BYTES, 0);
+        quantize_q8_k_row(x, q8_buf.as_mut_slice());
         for (r, o) in out.iter_mut().enumerate() {
             let off = r * row_len;
             let mut acc = 0.0f32;
@@ -292,18 +298,19 @@ fn gemv(m: &MatRef, x: &[f32], out: &mut [f32], scratch: &mut [f32; QK_K]) {
                 // block-wise dots when the row spans several (e.g. MLP down).
                 acc += q4_k_dot_q8_k(
                     &bytes[off + b * Q4K_BLOCK_BYTES..off + (b + 1) * Q4K_BLOCK_BYTES],
-                    &q8[b * Q8K_BLOCK_BYTES..(b + 1) * Q8K_BLOCK_BYTES],
+                    &q8_buf[b * Q8K_BLOCK_BYTES..(b + 1) * Q8K_BLOCK_BYTES],
                 );
             }
             *o = acc;
         }
-        return;
+        return Ok(());
     }
     let rlen = row_bytes(dt, m.cols);
     for (r, o) in out.iter_mut().enumerate() {
         let off = r * rlen;
         *o = row_dot(dt, &bytes[off..off + rlen], m.cols, x, scratch);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -890,9 +897,10 @@ impl GgufEngine {
         let mut q = vec![0.0; q_dim];
         let mut k = vec![0.0; kv_dim];
         let mut v = vec![0.0; kv_dim];
-        gemv(&layer.attn_q, &x, &mut q, scratch);
-        gemv(&layer.attn_k, &x, &mut k, scratch);
-        gemv(&layer.attn_v, &x, &mut v, scratch);
+        let mut q8 = Vec::new();
+        gemv(&layer.attn_q, &x, &mut q, scratch, &mut q8)?;
+        gemv(&layer.attn_k, &x, &mut k, scratch, &mut q8)?;
+        gemv(&layer.attn_v, &x, &mut v, scratch, &mut q8)?;
         if !layer.q_bias.is_empty() {
             for (o, b) in q.iter_mut().zip(&layer.q_bias) {
                 *o += b;
@@ -911,7 +919,7 @@ impl GgufEngine {
         let q_pre_rope = q.clone();
         let k_pre_rope = k.clone();
 
-        let qk_normed = !layer.qk_norm.is_none();
+        let qk_normed = layer.qk_norm.is_some();
         if let Some((qw, kw)) = &layer.qk_norm {
             for h in 0..n_heads {
                 rms_norm(&mut q[h * hd..(h + 1) * hd], qw, cfg.rms_eps);
@@ -975,7 +983,7 @@ impl GgufEngine {
         }
 
         let mut o = vec![0.0; d];
-        gemv(&layer.attn_o, &attn, &mut o, scratch);
+        gemv(&layer.attn_o, &attn, &mut o, scratch, &mut q8)?;
         let mut out = x_in.to_vec();
         for i in 0..d {
             out[i] += o[i];
@@ -987,8 +995,8 @@ impl GgufEngine {
         rms_norm(&mut mlp_in, &layer.post_norm, cfg.rms_eps);
         let mut gate = vec![0.0; inter];
         let mut up = vec![0.0; inter];
-        gemv(&layer.ffn_gate, &mlp_in, &mut gate, scratch);
-        gemv(&layer.ffn_up, &mlp_in, &mut up, scratch);
+        gemv(&layer.ffn_gate, &mlp_in, &mut gate, scratch, &mut q8)?;
+        gemv(&layer.ffn_up, &mlp_in, &mut up, scratch, &mut q8)?;
         for i in 0..inter {
             let g = gate[i];
             gate[i] = if cfg.use_gelu {
@@ -1001,7 +1009,7 @@ impl GgufEngine {
         }
         let gate_act = gate.clone();
         let mut down = vec![0.0; d];
-        gemv(&layer.ffn_down, &up, &mut down, scratch);
+        gemv(&layer.ffn_down, &up, &mut down, scratch, &mut q8)?;
         let mut final_out = attn_out.clone();
         for i in 0..d {
             final_out[i] += down[i];
@@ -1097,9 +1105,10 @@ impl GgufEngine {
         let mut q = vec![0.0; q_dim];
         let mut k = vec![0.0; kv_dim];
         let mut v = vec![0.0; kv_dim];
-        gemv(&layer.attn_q, x, &mut q, scratch);
-        gemv(&layer.attn_k, x, &mut k, scratch);
-        gemv(&layer.attn_v, x, &mut v, scratch);
+        let mut q8 = Vec::new();
+        gemv(&layer.attn_q, x, &mut q, scratch, &mut q8)?;
+        gemv(&layer.attn_k, x, &mut k, scratch, &mut q8)?;
+        gemv(&layer.attn_v, x, &mut v, scratch, &mut q8)?;
         if !layer.q_bias.is_empty() {
             for (o, b) in q.iter_mut().zip(&layer.q_bias) {
                 *o += b;
@@ -1175,7 +1184,8 @@ impl GgufEngine {
         }
 
         let mut o = vec![0.0; d];
-        gemv(&layer.attn_o, &attn, &mut o, scratch);
+        let mut q8 = Vec::new();
+        gemv(&layer.attn_o, &attn, &mut o, scratch, &mut q8)?;
         for i in 0..d {
             x[i] = input[i] + o[i];
         }
@@ -1184,8 +1194,8 @@ impl GgufEngine {
         rms_norm(&mut mlp_in, &layer.post_norm, cfg.rms_eps);
         let mut gate = vec![0.0; inter];
         let mut up = vec![0.0; inter];
-        gemv(&layer.ffn_gate, &mlp_in, &mut gate, scratch);
-        gemv(&layer.ffn_up, &mlp_in, &mut up, scratch);
+        gemv(&layer.ffn_gate, &mlp_in, &mut gate, scratch, &mut q8)?;
+        gemv(&layer.ffn_up, &mlp_in, &mut up, scratch, &mut q8)?;
         for i in 0..inter {
             let g = gate[i];
             gate[i] = if cfg.use_gelu {
@@ -1197,7 +1207,7 @@ impl GgufEngine {
             up[i] *= gate[i];
         }
         let mut down = vec![0.0; d];
-        gemv(&layer.ffn_down, &up, &mut down, scratch);
+        gemv(&layer.ffn_down, &up, &mut down, scratch, &mut q8)?;
         for i in 0..d {
             x[i] += down[i];
         }
@@ -1207,14 +1217,15 @@ impl GgufEngine {
     fn project(&self, x: &[f32], scratch: &mut [f32; QK_K]) -> Result<Vec<f32>> {
         let vocab = self.cfg.vocab_size;
         let mut logits = vec![0.0; vocab];
+        let mut q8 = Vec::new();
         match &self.output {
             Some(m) => {
                 if m.rows != vocab {
                     bail!("output.weight rows {} != vocab {vocab}", m.rows);
                 }
-                gemv(m, x, &mut logits, scratch);
+                gemv(m, x, &mut logits, scratch, &mut q8)?;
             }
-            None => gemv(&self.embed, x, &mut logits, scratch),
+            None => gemv(&self.embed, x, &mut logits, scratch, &mut q8)?,
         }
         Ok(logits)
     }

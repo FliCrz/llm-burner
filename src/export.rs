@@ -751,7 +751,7 @@ mod tests {
     /// what llama.cpp expects and fail to load. The exporter must therefore
     /// leave `token_embd.weight` to serve both roles.
     #[test]
-    fn tied_embeddings_export_output_weight() {
+    fn tied_embeddings_do_not_export_output_weight() {
         use crate::model::LlmModelConfig;
         use crate::train::TestBackend;
         use rlx_gguf::GgufFile;
