@@ -1,8 +1,8 @@
 //! Crack open decoder layer 0 of the real checkpoint: print norms after each
 //! internal op to find which sub-step explodes.
-use std::path::Path;
 use burn::tensor::{DType, Int};
 use burn_store::ModuleSnapshot;
+use std::path::Path;
 
 type B = burn::backend::Flex<f32, i32>;
 
@@ -16,7 +16,7 @@ fn rms(t: &burn::tensor::Tensor<B, 3>) -> f32 {
 fn main() -> anyhow::Result<()> {
     let dir_arg = std::env::args().nth(1).expect("model_dir");
     let dir = Path::new(&dir_arg);
-    let cfg = llm_burner::config::TransformersConfig::from_path(&dir.join("config.json"))?;
+    let cfg = llm_burner::config::TransformersConfig::from_path(dir.join("config.json"))?;
     let config = llm_burner::model::LlmModelConfig::from_transformers(&cfg);
     let tok = llm_burner::data::TokenizerStore::from_file(&dir.join("tokenizer.json"))?;
     let shards = llm_burner::hf::classify_download(dir)?.safetensors;
@@ -51,7 +51,8 @@ fn main() -> anyhow::Result<()> {
     };
     let (qm, qs) = flat(q.clone());
     println!("q mean={qm:.4} std={qs:.4}");
-    let _ = k; let _ = v;
+    let _ = k;
+    let _ = v;
     let a_out = attn.forward(n1);
     println!("attn out rms = {:.4}", rms(&a_out));
 
@@ -62,7 +63,10 @@ fn main() -> anyhow::Result<()> {
     let mlp_out = layer.mlp.forward(n2);
     println!("mlp out rms = {:.4}", rms(&mlp_out));
     let x3 = mlp_out.add(x2);
-    println!("after layer0 rms = {:.4}  (pipeline sweep said 0.23)", rms(&x3));
+    println!(
+        "after layer0 rms = {:.4}  (pipeline sweep said 0.23)",
+        rms(&x3)
+    );
 
     // Also verify against ModuleSnapshot collect for weight sanity of this layer.
     for s in model.collect(None, None, false) {
@@ -70,7 +74,11 @@ fn main() -> anyhow::Result<()> {
         if p == "model.layers.0.self_attn.q_proj.weight" || p == "model.norm.weight" {
             let data = s.to_data()?;
             let dt = data.dtype;
-            let d2 = if dt == DType::F32 { data } else { data.convert_dtype(DType::F32) };
+            let d2 = if dt == DType::F32 {
+                data
+            } else {
+                data.convert_dtype(DType::F32)
+            };
             let v = d2.to_vec()?;
             let m = v.iter().sum::<f32>() / v.len() as f32;
             let var = v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / v.len() as f32;

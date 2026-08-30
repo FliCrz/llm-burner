@@ -1,7 +1,7 @@
 //! Loading Hugging Face safetensors checkpoints into a [`LlmModel`] and saving
 //! them back in a retrainable (PyTorch-compatible) layout.
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::model::model::LlmModel;
@@ -68,38 +68,42 @@ pub fn load_from_safetensors<B: Backend>(
     paths: &[&Path],
     target_dtype: DType,
 ) -> Result<()> {
-    let expected: HashSet<String> = model
-        .collect(None, None, false)
-        .iter()
-        .map(|snapshot| snapshot.full_path())
-        .collect();
+    // Parse every shard once and merge the lazy tensor snapshots, then walk the
+    // module a single time with all of them. Applying shard by shard would
+    // re-traverse the whole model once per file (and `apply_to` on an
+    // arbitrary number of shards scales the startup cost linearly with the
+    // shard count), which the heavy models this loader targets pay for twice.
+    let adapter: Box<dyn ModuleAdapter> = FloatDTypeAdapter::new(target_dtype)
+        .chain(PyTorchToBurnAdapter)
+        .clone_box();
 
-    let mut applied = HashSet::new();
+    let mut merged: BTreeMap<String, TensorSnapshot> = BTreeMap::new();
     for path in paths {
-        let mut store = SafetensorsStore::from_file(path)
-            .with_from_adapter(FloatDTypeAdapter::new(target_dtype).chain(PyTorchToBurnAdapter))
-            .allow_partial(true)
-            .validate(true);
-        let result = store
-            .apply_to(model)
-            .with_context(|| format!("failed to load weights from `{}`", path.display()))?;
-        if !result.errors.is_empty() {
-            anyhow::bail!(
-                "errors while loading `{}`: {:#?}",
-                path.display(),
-                result.errors
-            );
+        let mut store = SafetensorsStore::from_file(path).allow_partial(true);
+        let shard_snapshots = store
+            .get_all_snapshots()
+            .with_context(|| format!("failed to parse weights from `{}`", path.display()))?;
+        for (name, snapshot) in shard_snapshots {
+            merged.insert(name.clone(), snapshot.clone());
         }
-        applied.extend(result.applied);
     }
 
-    let missing: Vec<&String> = expected.difference(&applied).collect();
+    let result = model.apply(merged.into_values().collect(), None, Some(adapter), false);
+    if !result.errors.is_empty() {
+        anyhow::bail!("errors while loading checkpoints: {:#?}", result.errors);
+    }
+
+    let missing: Vec<String> = result
+        .missing
+        .iter()
+        .map(|(path, _ctx)| path.clone())
+        .collect();
     // Checkpoints fine-tuned before QKV-bias support legitimately lack the
     // attention bias tensors; they were dropped (not adapted) during that
     // run's load, so zero-initialized biases faithfully represent them.
     let is_qkv_bias =
-        |p: &String| p.ends_with(".bias") && p.contains("_proj.bias") && !p.contains("o_proj");
-    let (missing_biases, missing_required): (Vec<&String>, Vec<&String>) =
+        |p: &str| p.ends_with(".bias") && p.contains("_proj.bias") && !p.contains("o_proj");
+    let (missing_biases, missing_required): (Vec<String>, Vec<String>) =
         missing.into_iter().partition(|p| is_qkv_bias(p));
     if !missing_biases.is_empty() {
         log::warn!(
@@ -115,6 +119,33 @@ pub fn load_from_safetensors<B: Backend>(
         );
     }
     Ok(())
+}
+
+/// The floating-point dtype and tensor count of a checkpoint, read from the
+/// first shard's header without materializing any data.
+///
+/// Used for startup diagnostics: when the stored dtype differs from the load
+/// target (e.g. a bf16 checkpoint cast up to f32), the conversion — and the
+/// doubled memory — is worth warning about before the model is built.
+pub fn checkpoint_dtype(shards: &[&Path]) -> Result<(DType, usize)> {
+    let Some(first) = shards.first() else {
+        anyhow::bail!("no `.safetensors` shards to inspect");
+    };
+    let mut store = SafetensorsStore::from_file(first);
+    let snapshots = store
+        .get_all_snapshots()
+        .with_context(|| format!("failed to parse `{}`", first.display()))?;
+    let stored = snapshots
+        .values()
+        .find_map(|s| {
+            matches!(
+                s.dtype,
+                DType::F64 | DType::F32 | DType::Flex32 | DType::F16 | DType::BF16
+            )
+            .then_some(s.dtype)
+        })
+        .unwrap_or(DType::F32);
+    Ok((stored, snapshots.len()))
 }
 
 /// Save the model to a `.safetensors` file in PyTorch-compatible layout
@@ -143,6 +174,59 @@ mod tests {
             .with_to_adapter(FloatDTypeAdapter::new(dtype).chain(BurnToPyTorchAdapter))
             .overwrite(true);
         store.collect_from(model).unwrap();
+    }
+
+    /// A zero-initialized shell fed from a checkpoint must end up bit-identical
+    /// to a normally-initialized model fed the same weights. Guards the
+    /// [`LlmModel::new_zeroed`] fast path used by generate/export: the only way a
+    /// zeroed parameter could leak through is if the loader silently accepted a
+    /// missing tensor, which must never happen.
+    #[test]
+    fn zero_init_shell_loads_identically_to_new() {
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::tiny();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+
+        let source = LlmModel::<B>::new(&config, &device);
+        save_to_safetensors(&source, &path).unwrap();
+
+        let mut from_new = LlmModel::<B>::new(&config, &device);
+        load_from_safetensors(&mut from_new, &[&path], DType::F32).unwrap();
+
+        let mut from_zeroed = LlmModel::<B>::new_zeroed(&config, &device);
+        load_from_safetensors(&mut from_zeroed, &[&path], DType::F32).unwrap();
+
+        let a = from_new.collect(None, None, false);
+        let b = from_zeroed.collect(None, None, false);
+        assert_eq!(a.len(), b.len(), "tensor counts differ");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.full_path(), y.full_path(), "paths differ");
+            assert_eq!(
+                x.to_data().unwrap().to_vec::<f32>().unwrap(),
+                y.to_data().unwrap().to_vec::<f32>().unwrap(),
+                "tensor `{}` differs after zeroed load",
+                x.full_path()
+            );
+        }
+    }
+
+    /// [`checkpoint_dtype`] must report the storage dtype and tally the tensors
+    /// of a checkpoint without materializing any data.
+    #[test]
+    fn checkpoint_dtype_reports_stored_precision() {
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig::tiny();
+
+        let dir = tempdir().unwrap();
+        let bf16_path = dir.path().join("model-bf16.safetensors");
+        let source = LlmModel::<B>::new(&config, &device);
+        save_with_float_dtype(&source, &bf16_path, DType::BF16);
+
+        let (stored, count) = checkpoint_dtype(&[&bf16_path]).unwrap();
+        assert_eq!(stored, DType::BF16);
+        assert_eq!(count, source.collect(None, None, false).len());
     }
 
     #[test]
@@ -243,6 +327,46 @@ mod tests {
         let mut dest = LlmModel::<B>::new(&bigger, &device);
         let err = load_from_safetensors(&mut dest, &[&path], DType::F32).unwrap_err();
         assert!(err.to_string().contains("missing"), "{}", err);
+    }
+
+    /// Regression test for loading google/gemma-2b: its config.json omits
+    /// `tie_word_embeddings` (HF's Gemma default ties embeddings, so the
+    /// checkpoint stores no `lm_head.weight`) and the original `gemma` model
+    /// type has no per-head query/key norm tensors. The parsed config must
+    /// build a matching model or every load fails with dozens of "missing"
+    /// tensors.
+    #[test]
+    fn gemma1_tied_untied_qk_norms_load() {
+        let device = burn::backend::flex::FlexDevice;
+        let transformers = crate::config::TransformersConfig::from_value(&serde_json::json!({
+            "model_type": "gemma",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "num_hidden_layers": 2,
+            "vocab_size": 256,
+            "max_position_embeddings": 64
+        }))
+        .unwrap();
+        let config = crate::model::LlmModelConfig::from_transformers(&transformers);
+        assert!(config.tie_word_embeddings, "gemma must default to tied");
+        assert!(!config.has_qk_norm, "gemma (1) has no query/key norms");
+
+        let source = LlmModel::<B>::new(&config, &device);
+        assert!(!source.collect(None, None, false).iter().any(
+            |s| s.full_path().contains("lm_head")
+                || s.full_path().contains("q_norm")
+                || s.full_path().contains("k_norm")
+        ));
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gemma1.safetensors");
+        save_to_safetensors(&source, &path).unwrap();
+
+        let mut dest = LlmModel::<B>::new(&config, &device);
+        load_from_safetensors(&mut dest, &[&path], DType::F32).unwrap();
     }
 
     /// Checkpoints fine-tuned before QKV-bias support have no attention bias

@@ -120,7 +120,13 @@ impl TransformersConfig {
         let attention_head_dim =
             get_usize_opt(object, "head_dim")?.unwrap_or(hidden_size / num_attention_heads);
 
-        let has_qk_norm = model_type.contains("gemma");
+        // HF's `GemmaTextConfig` ties word embeddings by default and many
+        // gemma releases omit the key from config.json entirely; every other
+        // supported family defaults to untied.
+        let is_gemma = model_type.contains("gemma");
+        // Per-head query/key RMS norms exist from Gemma 2 onward; the original
+        // Gemma checkpoints carry no `q_norm`/`k_norm` tensors.
+        let has_qk_norm = is_gemma && model_type != "gemma";
 
         Ok(Self {
             architecture,
@@ -135,7 +141,7 @@ impl TransformersConfig {
             max_position_embeddings: get_usize(object, "max_position_embeddings")?,
             rms_norm_eps: get_f64_opt(object, "rms_norm_eps")?.unwrap_or(1e-5),
             rope_theta: get_f64_opt(object, "rope_theta")?.unwrap_or(10_000.0),
-            tie_word_embeddings: get_bool_opt(object, "tie_word_embeddings")?.unwrap_or(false),
+            tie_word_embeddings: get_bool_opt(object, "tie_word_embeddings")?.unwrap_or(is_gemma),
             sliding_window: get_usize_opt(object, "sliding_window")?,
             hidden_act: get_string_opt(object, "hidden_act")?.unwrap_or_else(|| "silu".into()),
             attention_bias: get_bool_opt(object, "attention_bias")?,
@@ -344,6 +350,63 @@ mod tests {
         assert_eq!(config.num_key_value_heads, 2);
         assert_eq!(config.attention_head_dim, 64);
         assert_eq!(config.rope_theta, 1_000_000.0);
+    }
+
+    /// The original Gemma (`model_type: "gemma"`, e.g. google/gemma-2b) has no
+    /// per-head query/key norms and ties word embeddings by default (HF's
+    /// `GemmaTextConfig` default; its config.json omits the key entirely), yet
+    /// still exports under the `gemma` GGUF architecture.
+    #[test]
+    fn parses_gemma1_without_qk_norm_and_tied_by_default() {
+        // Mirrors the relevant fields of google/gemma-2b's config.json.
+        let config = TransformersConfig::from_value(&json!({
+            "architectures": ["GemmaForCausalLM"],
+            "attention_bias": false,
+            "head_dim": 256,
+            "hidden_act": "gelu",
+            "hidden_size": 2048,
+            "intermediate_size": 16384,
+            "max_position_embeddings": 8192,
+            "model_type": "gemma",
+            "num_attention_heads": 8,
+            "num_hidden_layers": 18,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 10000.0,
+            "vocab_size": 256000
+        }))
+        .unwrap();
+
+        assert!(!config.has_qk_norm);
+        assert!(config.tie_word_embeddings);
+        assert_eq!(config.gguf_architecture(), "gemma");
+
+        let model = crate::model::LlmModelConfig::from_transformers(&config);
+        assert!(!model.has_qk_norm);
+        assert!(model.tie_word_embeddings);
+        let untied_model = crate::model::LlmModelConfig {
+            tie_word_embeddings: false,
+            ..model.clone()
+        };
+        assert_eq!(
+            untied_model.param_count() - model.param_count(),
+            (model.d_model * model.vocab_size) as u64,
+            "tied model must not count an extra lm_head matrix"
+        );
+
+        // An explicit untied gemma release must be honored.
+        let untied = TransformersConfig::from_value(&json!({
+            "model_type": "gemma",
+            "hidden_size": 2048,
+            "intermediate_size": 16384,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 18,
+            "vocab_size": 256000,
+            "max_position_embeddings": 8192,
+            "tie_word_embeddings": false
+        }))
+        .unwrap();
+        assert!(!untied.tie_word_embeddings);
     }
 
     #[test]

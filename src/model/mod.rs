@@ -1,6 +1,7 @@
 pub mod ablation;
 pub mod attention;
 pub mod decoder;
+pub mod gguf;
 pub mod load;
 pub mod mlp;
 #[allow(clippy::module_inception)]

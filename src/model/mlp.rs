@@ -27,10 +27,27 @@ impl<B: Backend> Mlp<B> {
         use_gelu: bool,
         device: &B::Device,
     ) -> Self {
-        let initializer = Initializer::Normal {
-            mean: 0.0,
-            std: 0.02,
-        };
+        Self::new_with_initializer(
+            hidden_size,
+            intermediate_size,
+            use_gelu,
+            Initializer::Normal {
+                mean: 0.0,
+                std: 0.02,
+            },
+            device,
+        )
+    }
+
+    /// Create an MLP block using an explicit initializer (zeros when only a
+    /// checkpoint shell is needed, see [`super::model::Transformer::new_zeroed`]).
+    pub(crate) fn new_with_initializer(
+        hidden_size: usize,
+        intermediate_size: usize,
+        use_gelu: bool,
+        initializer: Initializer,
+        device: &B::Device,
+    ) -> Self {
         let gate_proj = LinearConfig::new(hidden_size, intermediate_size)
             .with_bias(false)
             .with_initializer(initializer.clone())

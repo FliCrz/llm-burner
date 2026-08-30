@@ -147,13 +147,6 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
     let pre = if arch == "qwen2" { Some("qwen2") } else { None };
     add_tokenizer_metadata(&mut writer, tokenizer, config.vocab_size, pre);
 
-    // Tied-embedding models have no `lm_head` parameter, so the loop below
-    // never produces an `output.weight`. llama.cpp would fall back to using
-    // `token_embd` as the output projection, but that fallback yields garbage
-    // output in practice — the official HF converter duplicates the embedding
-    // matrix into `output.weight`, and so do we.
-    let mut tied_output: Option<(Vec<usize>, GgmlType, Vec<u8>)> = None;
-
     for snapshot in &snapshots {
         let Some(gguf_name) = gguf_tensor_name(&snapshot.full_path()) else {
             log::warn!("skipping untranslated tensor `{}`", snapshot.full_path());
@@ -180,6 +173,17 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
             converted.to_vec::<f32>().map_err(|e| {
                 anyhow::anyhow!("failed to read `{}` as f32: {e}", snapshot.full_path())
             })?
+        };
+
+        let floats = if arch == "gemma" && snapshot.full_path().ends_with("norm.weight") {
+            // HF Gemma's RmsNorm computes `x * (1 + weight)` while llama.cpp's
+            // gemma graph applies a plain `x * weight`. The official converter
+            // (conversion/gemma.py) therefore stores `weight + 1`. Without this
+            // shift every decoder layer's normalization is wrong, collapsing the
+            // model into garbage. Applies to attn/ffn/output norms alike.
+            floats.into_iter().map(|v| v + 1.0).collect()
+        } else {
+            floats
         };
 
         // GGUF declares dimensions fastest-first: ne[0] is the contiguous
@@ -225,19 +229,9 @@ pub fn export_gguf<B: burn::tensor::backend::Backend>(
         let bytes = quantize(&floats, dtype)
             .map_err(|e| anyhow::anyhow!("failed to quantize `{gguf_name}` with {dtype:?}: {e}"))?;
 
-        if gguf_name == "token_embd.weight" && config.tie_word_embeddings {
-            tied_output = Some((shape_vec.clone(), dtype, bytes.clone()));
-        }
         writer
             .add_tensor_bytes(gguf_name.clone(), shape_vec, dtype, bytes)
             .with_context(|| format!("failed to add tensor `{gguf_name}`"))?;
-    }
-
-    if let Some((shape, dtype, bytes)) = tied_output {
-        log::info!("tied embeddings: writing token_embd matrix as output.weight for llama.cpp");
-        writer
-            .add_tensor_bytes("output.weight".to_string(), shape, dtype, bytes)
-            .context("failed to add tensor `output.weight`")?;
     }
 
     writer
@@ -750,12 +744,14 @@ mod tests {
     }
 
     /// Tied-embedding models (Qwen2.5, Gemma) have no `lm_head` parameter, so
-    /// without special handling no `output.weight` reaches the GGUF. llama.cpp
-    /// then falls back to using `token_embd` as the output projection — which
-    /// produces garbage output. The exporter must duplicate the embedding
-    /// matrix into an explicit `output.weight` tensor.
+    /// no `output.weight` is written. llama.cpp's architecture loaders treat
+    /// the output projection as duplicated from `token_embd` for tied models
+    /// (e.g. gemma always, llama when `tie_word_embeddings` is set), so
+    /// writing an extra `output.weight` would push the tensor count one above
+    /// what llama.cpp expects and fail to load. The exporter must therefore
+    /// leave `token_embd.weight` to serve both roles.
     #[test]
-    fn tied_embeddings_export_output_weight() {
+    fn tied_embeddings_do_not_export_output_weight() {
         use crate::model::LlmModelConfig;
         use crate::train::TestBackend;
         use rlx_gguf::GgufFile;
@@ -781,23 +777,13 @@ mod tests {
         let file = GgufFile::from_path(&path).unwrap();
 
         assert!(file.tensors.contains_key("token_embd.weight"));
-        assert!(file.tensors.contains_key("output.weight"));
-        assert_eq!(
-            file.tensors["output.weight"].shape,
-            vec![config.d_model, config.vocab_size]
+        // Tied models must NOT emit a separate output.weight: llama.cpp
+        // duplicates the output from token_embd and would reject the extra
+        // tensor with a wrong-tensor-count error.
+        assert!(
+            !file.tensors.contains_key("output.weight"),
+            "tied model must not emit a separate output.weight"
         );
-        assert_eq!(
-            file.tensors["output.weight"].dtype,
-            file.tensors["token_embd.weight"].dtype
-        );
-
-        // The output projection must be a copy of the embedding matrix.
-        let (embd, _) = file.dequant_f32("token_embd.weight").unwrap();
-        let (out, _) = file.dequant_f32("output.weight").unwrap();
-        assert_eq!(embd.len(), out.len());
-        for (i, (a, b)) in embd.iter().zip(out.iter()).enumerate() {
-            assert_eq!(a, b, "output.weight differs from token_embd at {i}");
-        }
     }
 
     /// Qwen2-style checkpoints train non-zero attention QKV biases. They must
@@ -844,6 +830,136 @@ mod tests {
         for (i, (g, e)) in got.iter().zip(floats.iter()).enumerate() {
             assert_eq!(g, e, "q bias mismatch at flat index {i}");
         }
+    }
+
+    /// HF Gemma's RmsNorm computes `x * (1 + weight)` while llama.cpp applies a
+    /// plain `x * weight`, so every gemma norm must be exported with `+1` baked
+    /// in (see conversion/gemma.py). Missing this shift collapses the model to
+    /// gibberish. Applies identically to the three norm kinds we export.
+    #[test]
+    fn gemma_norms_are_shifted_by_one() {
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig {
+            hf_model_type: "gemma".into(),
+            use_gelu: true,
+            ..LlmModelConfig::tiny()
+        };
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+        let tokenizer = dummy_tokenizer(&config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gemma-norm.gguf");
+        export_gguf(&model, &config, &tokenizer, &path, "test").unwrap();
+        let file = GgufFile::from_path(&path).unwrap();
+
+        let snapshots = model.collect(None, None, false);
+        let raw = |p: &str| {
+            snapshots
+                .iter()
+                .find(|s| s.full_path() == p)
+                .unwrap()
+                .to_data()
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+
+        // output_norm <- model.norm.weight
+        let pairs = [
+            ("model.norm.weight", "output_norm.weight"),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "blk.0.attn_norm.weight",
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "blk.0.ffn_norm.weight",
+            ),
+        ];
+        for (hf, gguf) in pairs {
+            let expected: Vec<f32> = raw(hf).into_iter().map(|v| v + 1.0).collect();
+            let (got, _) = file.dequant_f32(gguf).unwrap();
+            assert_eq!(got, expected, "`{gguf}` must be stored as raw + 1");
+            assert_eq!(
+                file.tensors[gguf].dtype,
+                rlx_gguf::GgmlType::F32,
+                "`{gguf}` must stay F32"
+            );
+        }
+    }
+
+    /// Value-level round-trip on a gemma-family tiny model: every exported
+    /// tensor must match the in-memory parameters after the same
+    /// transforms the exporter applies (transpose 2-D linears to PyTorch
+    /// row-major, add 1 to norms, leave embeddings/biases alone, no RoPE
+    /// permutation for the NEOX gemma family). Tiny tensors stay F32, so the
+    /// comparison is exact and any transposition/layout bug is caught here
+    /// rather than surfacing as gibberish in llama.cpp.
+    #[test]
+    fn gemma_export_roundtrips_weight_values() {
+        use crate::model::LlmModelConfig;
+        use crate::train::TestBackend;
+        use rlx_gguf::GgufFile;
+
+        let device = burn::backend::flex::FlexDevice;
+        let config = LlmModelConfig {
+            hf_model_type: "gemma".into(),
+            use_gelu: true,
+            qkv_bias: true,
+            tie_word_embeddings: true,
+            ..LlmModelConfig::tiny()
+        };
+        let model = crate::model::LlmModel::<TestBackend>::new(&config, &device);
+        let tokenizer = dummy_tokenizer(&config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gemma-rt.gguf");
+        export_gguf(&model, &config, &tokenizer, &path, "test").unwrap();
+        let file = GgufFile::from_path(&path).unwrap();
+
+        let snapshots = model.collect(None, None, false);
+
+        // Recompute the expected flat GGUF buffer for a snapshot, mirroring
+        // the exporter's transforms exactly.
+        let expected = |snap: &burn_store::TensorSnapshot| -> Vec<f32> {
+            let mut floats = snap.to_data().unwrap().to_vec::<f32>().unwrap();
+            if config.hf_model_type.starts_with("gemma")
+                && snap.full_path().ends_with("norm.weight")
+            {
+                floats.iter_mut().for_each(|v| *v += 1.0);
+            }
+            if snap.shape.num_dims() == 2 && is_linear_weight(&snap.full_path()) {
+                // Burn `[in, out]` -> PyTorch `[out, in]` row-major. Gemma uses
+                // NEOX RoPE: no additional row permutation.
+                let [d0, d1] = snap.shape.dims::<2>();
+                transpose(&floats, d0, d1)
+            } else {
+                floats
+            }
+        };
+
+        for snap in &snapshots {
+            let Some(gguf_name) = gguf_tensor_name(&snap.full_path()) else {
+                continue;
+            };
+            let expect = expected(snap);
+            let (got, _) = file.dequant_f32(&gguf_name).unwrap();
+            assert_eq!(
+                got.len(),
+                expect.len(),
+                "element count mismatch for `{gguf_name}`"
+            );
+            for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+                assert_eq!(g, e, "value mismatch at flat index {i} for `{gguf_name}`");
+            }
+        }
+
+        // Sanity: every exported tensor was validated above.
+        assert!(!file.tensors.is_empty(), "no tensors validated");
     }
 
     /// Vocabs containing `<0xNN>` byte-fallback tokens follow SentencePiece

@@ -1,3 +1,4 @@
+use super::attention::LayerKv;
 use super::decoder::DecoderLayer;
 use super::rms_norm::RmsNorm;
 
@@ -82,10 +83,15 @@ impl LlmModelConfig {
     /// applies NEOX-style RoPE to unpermuted HF-layout Q/K weights for it,
     /// whereas the `llama` architecture expects interleaved (permuted) Q/K.
     /// Exporting a Qwen model as `llama` loads fine but generates garbage.
+    ///
+    /// Every Gemma generation — including the original `gemma`, which has no
+    /// per-head Q/K norms — uses NEOX-style RoPE and must map to `gemma`;
+    /// keying this on [`LlmModelConfig::has_qk_norm`] would wrongly export
+    /// Gemma-1 checkpoints as `llama`.
     pub fn gguf_architecture(&self) -> &'static str {
         if self.hf_model_type == "qwen2" {
             "qwen2"
-        } else if self.has_qk_norm {
+        } else if self.hf_model_type.starts_with("gemma") {
             "gemma"
         } else {
             "llama"
@@ -172,16 +178,47 @@ pub struct Transformer<B: Backend> {
 impl<B: Backend> Transformer<B> {
     /// Build a transformer from a configuration.
     pub fn new(config: &LlmModelConfig, device: &B::Device) -> Self {
-        let embed_tokens = EmbeddingConfig::new(config.vocab_size, config.d_model)
-            .with_initializer(burn::module::Initializer::Normal {
+        Self::with_initializer(
+            config,
+            device,
+            burn::module::Initializer::Normal {
                 mean: 0.0,
                 std: 0.02,
-            })
+            },
+        )
+    }
+
+    /// Build a transformer whose parameters are zero-initialized.
+    ///
+    /// The training path needs random (Normal) initialization; generation and
+    /// export build a model only to immediately overwrite every parameter from
+    /// a checkpoint. Random-drawing ~billions of floats at startup is pure
+    /// waste there (and the loader guarantees every required tensor is present,
+    /// so nothing is ever left as zeros), making this a substantially faster
+    /// way to construct the shell. Keep this in sync with [`Transformer::new`].
+    pub fn new_zeroed(config: &LlmModelConfig, device: &B::Device) -> Self {
+        Self::with_initializer(config, device, burn::module::Initializer::Zeros)
+    }
+
+    fn with_initializer(
+        config: &LlmModelConfig,
+        device: &B::Device,
+        init: burn::module::Initializer,
+    ) -> Self {
+        let embed_tokens = EmbeddingConfig::new(config.vocab_size, config.d_model)
+            .with_initializer(init.clone())
             .init(device);
+
+        // Gemma's RmsNorm computes `x * (1 + weight)`, so the hidden norms are
+        // exported with a baked-in +1 (see export_gguf). Training must use the
+        // same `1 + weight` form, otherwise the trained gains are tuned for a
+        // plain `x * weight` graph and the exported +1 makes llama.cpp apply a
+        // norm the optimizer never saw, collapsing output to a repetition loop.
+        let is_gemma = config.gguf_architecture() == "gemma";
 
         let layers = (0..config.n_layers)
             .map(|_| {
-                let self_attn = super::attention::CausalAttention::new(
+                let self_attn = super::attention::CausalAttention::new_with_initializer(
                     config.d_model,
                     config.n_heads,
                     config.n_kv_heads,
@@ -191,16 +228,23 @@ impl<B: Backend> Transformer<B> {
                     config.has_qk_norm,
                     config.qkv_bias,
                     config.rms_eps,
+                    init.clone(),
                     device,
                 );
-                let mlp = super::mlp::Mlp::new(
+                let mlp = super::mlp::Mlp::new_with_initializer(
                     config.d_model,
                     config.intermediate_size,
                     config.use_gelu,
+                    init.clone(),
                     device,
                 );
-                let input_layernorm = RmsNorm::new(config.d_model, config.rms_eps, device);
-                let post_attention_layernorm = RmsNorm::new(config.d_model, config.rms_eps, device);
+                let mut input_layernorm = RmsNorm::new(config.d_model, config.rms_eps, device);
+                let mut post_attention_layernorm =
+                    RmsNorm::new(config.d_model, config.rms_eps, device);
+                if is_gemma {
+                    input_layernorm = input_layernorm.with_unit_offset();
+                    post_attention_layernorm = post_attention_layernorm.with_unit_offset();
+                }
                 DecoderLayer {
                     self_attn,
                     mlp,
@@ -210,7 +254,10 @@ impl<B: Backend> Transformer<B> {
             })
             .collect();
 
-        let norm = RmsNorm::new(config.d_model, config.rms_eps, device);
+        let mut norm = RmsNorm::new(config.d_model, config.rms_eps, device);
+        if is_gemma {
+            norm = norm.with_unit_offset();
+        }
 
         Self {
             embed_tokens,
@@ -227,6 +274,34 @@ impl<B: Backend> Transformer<B> {
         let mut x = x;
         for layer in &self.layers {
             x = layer.forward(x);
+        }
+        self.norm.forward(x)
+    }
+
+    /// Forward pass with an optional per-layer key/value cache for autoregressive generation.
+    pub fn forward_with_cache(
+        &self,
+        input: Tensor<B, 2, Int>,
+        cache: Option<&mut [LayerKv<B>]>,
+        start_pos: usize,
+    ) -> Tensor<B, 3> {
+        let mut x = self.embed_tokens.forward(input);
+        match cache {
+            Some(layer_caches) => {
+                assert_eq!(
+                    layer_caches.len(),
+                    self.layers.len(),
+                    "cache layer count does not match model layer count"
+                );
+                for (layer, layer_kv) in self.layers.iter().zip(layer_caches.iter_mut()) {
+                    x = layer.forward_with_cache(x, Some(layer_kv), start_pos);
+                }
+            }
+            None => {
+                for layer in &self.layers {
+                    x = layer.forward_with_cache(x, None, start_pos);
+                }
+            }
         }
         self.norm.forward(x)
     }
@@ -289,9 +364,50 @@ impl<B: Backend> LlmModel<B> {
         Self { model, lm_head }
     }
 
+    /// Build a zero-initialized model shell.
+    ///
+    /// Faster than [`LlmModel::new`] for workloads that immediately overwrite
+    /// every weight from a checkpoint (generation, export); see
+    /// [`Transformer::new_zeroed`].
+    pub fn new_zeroed(config: &LlmModelConfig, device: &B::Device) -> Self {
+        let model = Transformer::new_zeroed(config, device);
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                LinearConfig::new(config.d_model, config.vocab_size)
+                    .with_bias(false)
+                    .with_initializer(burn::module::Initializer::Zeros)
+                    .init(device),
+            )
+        };
+        Self { model, lm_head }
+    }
+
     /// Forward pass over token indices, returning logits `[batch, seq, vocab]`.
     pub fn forward(&self, input: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let hidden = self.model.forward(input);
+        match &self.lm_head {
+            Some(head) => head.forward(hidden),
+            None => hidden.matmul(
+                self.model
+                    .embed_tokens
+                    .weight
+                    .val()
+                    .transpose()
+                    .unsqueeze::<3>(),
+            ),
+        }
+    }
+
+    /// Forward pass with an optional per-layer key/value cache, returning logits `[batch, seq, vocab]`.
+    pub fn forward_with_cache(
+        &self,
+        input: Tensor<B, 2, Int>,
+        cache: Option<&mut [LayerKv<B>]>,
+        start_pos: usize,
+    ) -> Tensor<B, 3> {
+        let hidden = self.model.forward_with_cache(input, cache, start_pos);
         match &self.lm_head {
             Some(head) => head.forward(hidden),
             None => hidden.matmul(

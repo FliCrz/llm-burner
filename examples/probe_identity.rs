@@ -5,7 +5,7 @@
 //! 2. Overfit: a healthy causal-LM stack drives memorization loss toward 0;
 //!    a broken one plateaus at ~ln(vocab).
 use burn::module::Module;
-use burn::tensor::{Int};
+use burn::tensor::Int;
 
 type B = burn::backend::Flex<f32, i32>;
 
@@ -39,8 +39,9 @@ fn main() -> anyhow::Result<()> {
     use burn::optim::adaptor::OptimizerAdaptor;
     use burn::optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
     type AD = burn::backend::Autodiff<B>;
-    let mut opt: OptimizerAdaptor<AdamW, llm_burner::model::LlmModel<AD>, AD> =
-        AdamWConfig::new().with_weight_decay(0.0).init::<AD, llm_burner::model::LlmModel<AD>>();
+    let mut opt: OptimizerAdaptor<AdamW, llm_burner::model::LlmModel<AD>, AD> = AdamWConfig::new()
+        .with_weight_decay(0.0)
+        .init::<AD, llm_burner::model::LlmModel<AD>>();
     let mut train_model: llm_burner::model::LlmModel<AD> =
         llm_burner::model::LlmModel::<B>::new(&config, &device).train();
     let seq: Vec<u32> = (0..16u32).cycle().take(64).collect();
@@ -60,7 +61,10 @@ fn main() -> anyhow::Result<()> {
         let loss = burn::nn::loss::CrossEntropyLoss::new(None, &device)
             .forward(logits.reshape([s, v]), tgt.reshape([s]));
         if step % 100 == 0 || step == 300 {
-            println!("[overfit] step {step}: loss {:.4}", loss.clone().into_scalar());
+            println!(
+                "[overfit] step {step}: loss {:.4}",
+                loss.clone().into_scalar()
+            );
         }
         let grads = loss.backward();
         let gs = GradientsParams::from_grads(grads, &train_model);

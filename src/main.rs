@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+#[cfg(feature = "gpu")]
+use half::{bf16, f16};
 use llm_burner::data::HfDataset;
 use llm_burner::hf::HfRepo;
 use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir};
@@ -151,6 +153,86 @@ enum Command {
         /// Model name string recorded in GGUF metadata.
         #[arg(long, default_value = "llm-burner-finetune")]
         model_name: String,
+
+        /// Device backend: `auto` uses GPU if available, `cpu` forces the
+        /// CPU backend.
+        #[arg(long, default_value_t = DeviceChoice::Auto)]
+        device: DeviceChoice,
+    },
+
+    /// Generate text from a loaded checkpoint.
+    Generate {
+        /// Model directory containing config.json, tokenizer.json, and .safetensors.
+        #[arg(long)]
+        model_dir: PathBuf,
+
+        /// Prompt to generate from.
+        #[arg(long)]
+        prompt: String,
+
+        /// Maximum number of new tokens to emit.
+        #[arg(long, default_value_t = 128)]
+        max_tokens: usize,
+
+        /// Temperature for sampling; `0.0` disables sampling and uses greedy decoding.
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f64,
+
+        /// Top-k filtering: keep only the top `k` tokens.
+        #[arg(long)]
+        top_k: Option<usize>,
+
+        /// Top-p (nucleus) filtering: keep the smallest set of tokens that sums to `p`.
+        #[arg(long)]
+        top_p: Option<f64>,
+
+        /// Weight dtype for the in-memory model: f32, bf16, or f16. On GPU
+        /// builds bf16/f16 halve memory and load bf16/f16 checkpoints without
+        /// conversion; on CPU builds Flex computes in f32 and the flag only
+        /// changes the load-conversion target.
+        #[arg(long, default_value_t = Precision::F32)]
+        precision: Precision,
+
+        /// Device backend: `auto` uses GPU if available, `cpu` forces the CPU backend.
+        #[arg(long, default_value_t = DeviceChoice::Auto)]
+        device: DeviceChoice,
+    },
+
+    /// Chat with a quantized GGUF model (CPU-only inference).
+    Chat {
+        /// Directory containing the exported `model.gguf`, `tokenizer.json`,
+        /// and `tokenizer_config.json` (use `--gguf`/`--tokenizer` to point at
+        /// specific files elsewhere).
+        #[arg(long, default_value = "artifacts/trained")]
+        model_dir: PathBuf,
+
+        /// Explicit GGUF file (defaults to `<model_dir>/model.gguf`).
+        #[arg(long)]
+        gguf: Option<PathBuf>,
+
+        /// Explicit tokenizer file (defaults to `<model_dir>/tokenizer.json`).
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+
+        /// Prompt to answer once and exit; when absent the interactive REPL runs.
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Temperature for sampling; `0.0` uses greedy decoding.
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f64,
+
+        /// Top-k filtering: keep only the top `k` tokens.
+        #[arg(long)]
+        top_k: Option<usize>,
+
+        /// Top-p (nucleus) filtering: keep the smallest set of tokens that sums to `p`.
+        #[arg(long)]
+        top_p: Option<f64>,
+
+        /// Maximum number of tokens per assistant reply.
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
     },
 }
 
@@ -353,9 +435,9 @@ fn main() -> anyhow::Result<()> {
             model_dir,
             output,
             model_name,
+            device,
         } => {
             init_stderr_logger();
-            // Load config from the model directory
             let config_path = model_dir.join("config.json");
             if !config_path.exists() {
                 anyhow::bail!("`config.json` not found in `{}`", model_dir.display());
@@ -364,14 +446,12 @@ fn main() -> anyhow::Result<()> {
                 .context(format!("failed to parse `{}`", config_path.display()))?;
             let config = llm_burner::model::LlmModelConfig::from_transformers(&transformers);
 
-            // Load tokenizer
             let tokenizer_path = model_dir.join("tokenizer.json");
             if !tokenizer_path.exists() {
                 anyhow::bail!("`tokenizer.json` not found in `{}`", model_dir.display());
             }
             let tokenizer = llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?;
 
-            // Load model weights
             let shards = llm_burner::hf::classify_download(&model_dir)?;
             let shards_refs: Vec<&std::path::Path> =
                 shards.safetensors.iter().map(PathBuf::as_path).collect();
@@ -382,26 +462,294 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let mut model = llm_burner::model::LlmModel::<llm_burner::train::InferBackend>::new(
-                &config,
-                &Default::default(),
-            );
-            llm_burner::model::load::load_from_safetensors(
-                &mut model,
-                &shards_refs,
-                burn::tensor::DType::F32,
-            )?;
-
-            // Export to GGUF
             let gguf_parent = output.parent().map(|p| p.to_path_buf()).unwrap_or_default();
             std::fs::create_dir_all(&gguf_parent)?;
-            let gguf_path = output;
-            llm_burner::export::export_gguf(&model, &config, &tokenizer, &gguf_path, &model_name)?;
 
-            log::info!("exported GGUF to {}", gguf_path.display());
+            #[cfg(feature = "gpu")]
+            match device {
+                DeviceChoice::Cpu => {
+                    let mut model =
+                        llm_burner::model::LlmModel::<burn::backend::Flex<f32, i32>>::new_zeroed(
+                            &config,
+                            &burn::backend::flex::FlexDevice,
+                        );
+                    llm_burner::model::load::load_from_safetensors(
+                        &mut model,
+                        &shards_refs,
+                        burn::tensor::DType::F32,
+                    )?;
+                    llm_burner::export::export_gguf(
+                        &model,
+                        &config,
+                        &tokenizer,
+                        &output,
+                        &model_name,
+                    )?;
+                }
+                _ => {
+                    let mut model =
+                        llm_burner::model::LlmModel::<llm_burner::train::InferBackend>::new_zeroed(
+                            &config,
+                            &Default::default(),
+                        );
+                    llm_burner::model::load::load_from_safetensors(
+                        &mut model,
+                        &shards_refs,
+                        burn::tensor::DType::F32,
+                    )?;
+                    llm_burner::export::export_gguf(
+                        &model,
+                        &config,
+                        &tokenizer,
+                        &output,
+                        &model_name,
+                    )?;
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                let mut model =
+                    llm_burner::model::LlmModel::<burn::backend::Flex<f32, i32>>::new_zeroed(
+                        &config,
+                        &burn::backend::flex::FlexDevice,
+                    );
+                llm_burner::model::load::load_from_safetensors(
+                    &mut model,
+                    &shards_refs,
+                    burn::tensor::DType::F32,
+                )?;
+                llm_burner::export::export_gguf(&model, &config, &tokenizer, &output, &model_name)?;
+            }
+
+            log::info!("exported GGUF to {}", output.display());
+        }
+        Command::Generate {
+            model_dir,
+            prompt,
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            precision,
+            device,
+        } => {
+            init_stderr_logger();
+            let gen_cfg = llm_burner::generate::GenerateConfig {
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                greedy: temperature <= 0.0,
+            };
+            let output = dispatch_generate(&model_dir, &prompt, &gen_cfg, device, precision)?;
+            println!("{output}");
+        }
+        Command::Chat {
+            model_dir,
+            gguf,
+            tokenizer,
+            prompt,
+            temperature,
+            top_k,
+            top_p,
+            max_tokens,
+        } => {
+            // The REPL owns the terminal; keep log output out of the way by
+            // piping it to a sibling `chat.log` like training does.
+            let log_path = model_dir.join("chat.log");
+            let _ = std::fs::remove_file(&log_path);
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .with_context(|| format!("failed to create `{}`", log_path.display()))?;
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .target(env_logger::Target::Pipe(Box::new(log_file)))
+                .init();
+            log::info!("logging to `{}`", log_path.display());
+
+            let gguf_path = gguf.unwrap_or_else(|| model_dir.join("model.gguf"));
+            if !gguf_path.exists() {
+                anyhow::bail!("GGUF file not found: `{}`", gguf_path.display());
+            }
+            let tokenizer_path = tokenizer.unwrap_or_else(|| model_dir.join("tokenizer.json"));
+            if !tokenizer_path.exists() {
+                anyhow::bail!(
+                    "tokenizer not found: `{}` (export it next to `model.gguf`)",
+                    tokenizer_path.display()
+                );
+            }
+
+            let engine = llm_burner::model::gguf::GgufEngine::load(&gguf_path)?;
+            let tokenizer = llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?;
+            let gen_cfg = llm_burner::generate::GenerateConfig {
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                greedy: temperature <= 0.0,
+            };
+
+            match prompt {
+                Some(p) => {
+                    let mut chat = llm_burner::chat::GgufChat::new(engine, tokenizer, gen_cfg);
+                    let reply = chat.respond(&p)?;
+                    println!("{reply}");
+                }
+                None => {
+                    let mut chat = llm_burner::chat::GgufChat::new(engine, tokenizer, gen_cfg);
+                    llm_burner::chat::repl(&mut chat)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Pick the backend for `generate` and run it.
+///
+/// On GPU builds the requested [`Precision`] selects the model's element type
+/// (`Wgpu<f32|bf16|f16>`), so a bf16 checkpoint loads into bf16 weights with no
+/// dtype conversion and half the memory. `--device cpu` and non-GPU builds are
+/// always `Flex<f32>`: Burn 0.21's Flex backend computes in f32 only, so the
+/// `--precision` flag there only picks the load-conversion target.
+fn dispatch_generate(
+    model_dir: &Path,
+    prompt: &str,
+    gen_cfg: &llm_burner::generate::GenerateConfig,
+    device: DeviceChoice,
+    precision: Precision,
+) -> anyhow::Result<String> {
+    #[cfg(feature = "gpu")]
+    {
+        match (device, precision) {
+            (DeviceChoice::Cpu, p) => {
+                if p != Precision::F32 {
+                    log::warn!(
+                        "computing in f32 on CPU; the requested {} changes only how \
+                         the checkpoint is converted before loading",
+                        p
+                    );
+                }
+                run_generate::<burn::backend::Flex<f32, i32>>(
+                    model_dir,
+                    prompt,
+                    gen_cfg,
+                    &burn::backend::flex::FlexDevice,
+                    burn::tensor::DType::F32,
+                )
+            }
+            (_, Precision::Bf16) => {
+                let device = Default::default();
+                run_generate::<burn::backend::Wgpu<bf16, i32>>(
+                    model_dir,
+                    prompt,
+                    gen_cfg,
+                    &device,
+                    Precision::Bf16.safetensors_dtype(),
+                )
+            }
+            (_, Precision::F16) => {
+                let device = Default::default();
+                run_generate::<burn::backend::Wgpu<f16, i32>>(
+                    model_dir,
+                    prompt,
+                    gen_cfg,
+                    &device,
+                    Precision::F16.safetensors_dtype(),
+                )
+            }
+            (_, Precision::F32) => {
+                let device = Default::default();
+                run_generate::<burn::backend::Wgpu<f32, i32>>(
+                    model_dir,
+                    prompt,
+                    gen_cfg,
+                    &device,
+                    Precision::F32.safetensors_dtype(),
+                )
+            }
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        if device == DeviceChoice::Gpu {
+            anyhow::bail!(
+                "`--device gpu` requires a GPU build; rebuild with the \
+                 default features (this binary only has the CPU backend)"
+            );
+        }
+        if precision != Precision::F32 {
+            log::warn!(
+                "Flex (CPU) computes in f32; the requested {} changes only how \
+                 the checkpoint is converted before loading",
+                precision
+            );
+        }
+        run_generate::<burn::backend::Flex<f32, i32>>(
+            model_dir,
+            prompt,
+            gen_cfg,
+            &burn::backend::flex::FlexDevice,
+            burn::tensor::DType::F32,
+        )
+    }
+}
+
+/// Build, load, and run a checkpoint shell of type `B`.
+///
+/// The model is zero-initialized (every weight is immediately overwritten by
+/// the checkpoint), loaded from all `.safetensors` shards in `model_dir`, and
+/// used to autoregressively generate `prompt`'s continuation.
+fn run_generate<B: burn::tensor::backend::Backend>(
+    model_dir: &Path,
+    prompt: &str,
+    gen_cfg: &llm_burner::generate::GenerateConfig,
+    device: &B::Device,
+    load_dtype: burn::tensor::DType,
+) -> anyhow::Result<String> {
+    let config_path = model_dir.join("config.json");
+    if !config_path.exists() {
+        anyhow::bail!("`config.json` not found in `{}`", model_dir.display());
+    }
+    let transformers = llm_burner::config::TransformersConfig::from_path(&config_path)
+        .with_context(|| format!("failed to parse `{}`", config_path.display()))?;
+    let config = llm_burner::model::LlmModelConfig::from_transformers(&transformers);
+
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    if !tokenizer_path.exists() {
+        anyhow::bail!("`tokenizer.json` not found in `{}`", model_dir.display());
+    }
+    let tokenizer = llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?;
+
+    let shards = llm_burner::hf::classify_download(model_dir)?;
+    let shards_refs: Vec<&std::path::Path> =
+        shards.safetensors.iter().map(PathBuf::as_path).collect();
+    if shards_refs.is_empty() {
+        anyhow::bail!(
+            "no `.safetensors` weights found in `{}`",
+            model_dir.display()
+        );
+    }
+
+    let (stored_dtype, tensor_count) = llm_burner::model::load::checkpoint_dtype(&shards_refs)?;
+    log::info!(
+        "checkpoint: {tensor_count} tensor(s) across {} shard(s), stored as {stored_dtype:?}",
+        shards_refs.len()
+    );
+    if stored_dtype != load_dtype {
+        log::warn!(
+            "checkpoint tensors are stored as {stored_dtype:?} but load as \
+             {load_dtype:?}; converting on ingest"
+        );
+    }
+
+    let mut model = llm_burner::model::LlmModel::<B>::new_zeroed(&config, device);
+    llm_burner::model::load::load_from_safetensors(&mut model, &shards_refs, load_dtype)?;
+
+    let output =
+        llm_burner::generate::generate(&model, &tokenizer, prompt, gen_cfg, config.max_seq_len)?;
+    Ok(output)
 }
 
 /// Resolve `(model_dir, dataset_dir)`, downloading the repos when the caller

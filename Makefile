@@ -1,4 +1,4 @@
-.PHONY: build test fmt clippy download train export-gguf help
+.PHONY: build test fmt clippy download train export-gguf chat help
 
 CARGO ?= cargo
 INSTALL_DIR ?= $(HOME)/.local/bin
@@ -19,6 +19,8 @@ help:
 	@echo "  make export-gguf ARGS='--model-dir DIR --output FILE [--model-name NAME]'"
 	@echo "                        DIR must contain config.json, tokenizer.json,"
 	@echo "                        and the fine-tuned .safetensors"
+	@echo "  make chat             Run the chat command against artifacts/trained"
+	@echo "  make chat ARGS='--model-dir DIR [--prompt TEXT] [--temperature 0]'"
 
 build:
 	@echo "Building release."
@@ -59,6 +61,11 @@ export-gguf:
 	@echo "Exporting to GGUF."
 	$(CARGO) run --release -- export $(ARGS)
 	@echo "Export done."
+
+chat:
+	@echo "Starting GGUF chat."
+	$(CARGO) run --release -- chat $(ARGS)
+	@echo "Chat done."
 
 clean:
 	@echo "Removing `target` folder."

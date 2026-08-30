@@ -220,6 +220,13 @@ impl TokenizerStore {
         Ok(encodings.iter().map(|e| e.get_ids().to_vec()).collect())
     }
 
+    /// Decode a sequence of token ids back into text.
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        self.tokenizer
+            .decode(ids, skip_special_tokens)
+            .map_err(|e| anyhow::anyhow!("tokenizer decoding failed: {e}"))
+    }
+
     /// The full vocabulary as `(token, id)` pairs ordered by id, suitable for
     /// writing GGUF `tokenizer.ggml.*` metadata.
     pub fn vocab_ordered(&self) -> Vec<(String, u32)> {

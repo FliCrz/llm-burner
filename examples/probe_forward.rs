@@ -9,25 +9,24 @@
 use std::path::Path;
 
 use burn::tensor::Int;
-use burn::tensor::backend::Backend;
-use llm_burner::data::{TokenizerStore, WindowStore};
+use llm_burner::data::WindowStore;
 use llm_burner::pipeline::load_model_from_dir;
-use llm_burner::train::Precision;
 
 fn main() -> anyhow::Result<()> {
     type B = burn::backend::Wgpu<f32, i32>;
     let mut args = std::env::args().skip(1);
-    let model_dir = args.next().expect("usage: probe_forward <model_dir> [text]");
-    let text = args.next().unwrap_or_else(|| "The capital of France is".into());
+    let model_dir = args
+        .next()
+        .expect("usage: probe_forward <model_dir> [text]");
+    let text = args
+        .next()
+        .unwrap_or_else(|| "The capital of France is".into());
 
-    let (model, config, tokenizer) = load_model_from_dir::<B>(Path::new(&model_dir), burn::tensor::DType::F32)?;
+    let (model, config, tokenizer) =
+        load_model_from_dir::<B>(Path::new(&model_dir), burn::tensor::DType::F32)?;
     println!(
         "loaded {} (d_model {}, {} layers, vocab {}) — tie_word_embeddings={}",
-        model_dir,
-        config.d_model,
-        config.n_layers,
-        config.vocab_size,
-        config.tie_word_embeddings
+        model_dir, config.d_model, config.n_layers, config.vocab_size, config.tie_word_embeddings
     );
 
     // Weight sanity: embedding rows must not be near-zero or exploded.
@@ -37,14 +36,19 @@ fn main() -> anyhow::Result<()> {
     let vals = flat.to_data().to_vec::<f32>()?;
     let mean: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
     let var: f32 = vals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / vals.len() as f32;
-    println!("embed: [{rows},{cols}] mean={mean:.4} std={:.4}", var.sqrt());
+    println!(
+        "embed: [{rows},{cols}] mean={mean:.4} std={:.4}",
+        var.sqrt()
+    );
 
-    let vocab: std::collections::HashMap<u32, String> =
-        tokenizer.vocab_ordered().into_iter().map(|(t, i)| (i, t)).collect();
+    let vocab: std::collections::HashMap<u32, String> = tokenizer
+        .vocab_ordered()
+        .into_iter()
+        .map(|(t, i)| (i, t))
+        .collect();
     let ids = tokenizer.encode_raw(&text)?;
     // Per-layer residual-stream RMS after each decoder layer (position -1).
     {
-        use burn::tensor::Int;
         let dev = Default::default();
         let input = burn::tensor::Tensor::<B, 2, Int>::from_data(
             burn::tensor::TensorData::new(ids.clone(), [1, ids.len()]),
@@ -79,8 +83,10 @@ fn main() -> anyhow::Result<()> {
     );
     let out = model.forward_classification(batch);
     let loss: f32 = out.loss.into_scalar();
-    println!("teacher-forced loss: {loss:.4}  (uniform-random baseline: ln(V) = {:.2})", 
-        (config.vocab_size as f32).ln());
+    println!(
+        "teacher-forced loss: {loss:.4}  (uniform-random baseline: ln(V) = {:.2})",
+        (config.vocab_size as f32).ln()
+    );
 
     // Greedy continuation: argmax at each step for a few tokens.
     let mut ids = ids.clone();
@@ -92,10 +98,15 @@ fn main() -> anyhow::Result<()> {
             &Default::default(),
         );
         let logits = model.forward(input);
-        let last = logits.slice([0..1, (seq - 1)..seq]).reshape([config.vocab_size]);
+        let last = logits
+            .slice([0..1, (seq - 1)..seq])
+            .reshape([config.vocab_size]);
         let vals = last.to_data().to_vec::<f32>()?;
-        let mut ranked: Vec<(u32, f32)> =
-            vals.iter().enumerate().map(|(i, v)| (i as u32, *v)).collect();
+        let mut ranked: Vec<(u32, f32)> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, *v))
+            .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let top: Vec<String> = ranked[..5.min(ranked.len())]
             .iter()
