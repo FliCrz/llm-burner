@@ -4302,6 +4302,7 @@ dependencies = [
  "minijinja",
  "ratatui",
  "rlx-gguf",
+ "safetensors 0.7.0",
  "serde",
  "serde_json",
  "tempfile",

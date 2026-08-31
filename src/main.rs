@@ -544,6 +544,30 @@ fn main() -> anyhow::Result<()> {
             let output = dispatch_generate(&model_dir, &prompt, &gen_cfg, device, precision)?;
             println!("{output}");
         }
+        Command::Merge {
+            base_dir,
+            lora_dir,
+            out,
+            scale,
+            export_gguf,
+            gguf_output,
+            model_name,
+            precision,
+            device,
+        } => {
+            init_stderr_logger();
+            let inputs = llm_burner::lora::MergePipelineInputs {
+                base_dir,
+                lora_dir,
+                out_dir: out,
+                scale,
+                precision,
+                export_gguf,
+                gguf_output,
+                model_name,
+            };
+            dispatch_merge(&inputs, device)?;
+        }
         Command::Chat {
             model_dir,
             gguf,
@@ -690,6 +714,77 @@ fn dispatch_generate(
             model_dir,
             prompt,
             gen_cfg,
+            &burn::backend::flex::FlexDevice,
+            burn::tensor::DType::F32,
+        )
+    }
+}
+
+/// Pick the backend for `merge` and run it.
+fn dispatch_merge(
+    inputs: &llm_burner::lora::MergePipelineInputs,
+    device: DeviceChoice,
+) -> anyhow::Result<llm_burner::lora::MergeSummary> {
+    #[cfg(feature = "gpu")]
+    {
+        match (device, inputs.precision) {
+            (DeviceChoice::Cpu, p) => {
+                if p != Precision::F32 {
+                    log::warn!(
+                        "computing in f32 on CPU; the requested {} changes only how \
+                         the checkpoint is converted before loading",
+                        p
+                    );
+                }
+                llm_burner::lora::run_merge::<burn::backend::Flex<f32, i32>>(
+                    inputs,
+                    &burn::backend::flex::FlexDevice,
+                    burn::tensor::DType::F32,
+                )
+            }
+            (_, Precision::Bf16) => {
+                let device = Default::default();
+                llm_burner::lora::run_merge::<burn::backend::Wgpu<bf16, i32>>(
+                    inputs,
+                    &device,
+                    Precision::Bf16.safetensors_dtype(),
+                )
+            }
+            (_, Precision::F16) => {
+                let device = Default::default();
+                llm_burner::lora::run_merge::<burn::backend::Wgpu<f16, i32>>(
+                    inputs,
+                    &device,
+                    Precision::F16.safetensors_dtype(),
+                )
+            }
+            (_, Precision::F32) => {
+                let device = Default::default();
+                llm_burner::lora::run_merge::<burn::backend::Wgpu<f32, i32>>(
+                    inputs,
+                    &device,
+                    Precision::F32.safetensors_dtype(),
+                )
+            }
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        if device == DeviceChoice::Gpu {
+            anyhow::bail!(
+                "`--device gpu` requires a GPU build; rebuild with the \
+                 default features (this binary only has the CPU backend)"
+            );
+        }
+        if inputs.precision != Precision::F32 {
+            log::warn!(
+                "Flex (CPU) computes in f32; the requested {} changes only how \
+                 the checkpoint is converted before loading",
+                inputs.precision
+            );
+        }
+        llm_burner::lora::run_merge::<burn::backend::Flex<f32, i32>>(
+            inputs,
             &burn::backend::flex::FlexDevice,
             burn::tensor::DType::F32,
         )
