@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use half::{bf16, f16};
 use llm_burner::data::HfDataset;
 use llm_burner::hf::HfRepo;
-use llm_burner::pipeline::{PipelineInputs, default_dataset_dir, default_model_dir};
+use llm_burner::pipeline::{default_dataset_dir, default_model_dir, PipelineInputs};
 use llm_burner::probe::DeviceChoice;
 use llm_burner::train::{Precision, TrainConfig};
 
@@ -198,6 +198,45 @@ enum Command {
         device: DeviceChoice,
     },
 
+    /// Merge a LoRA adapter into a base model and optionally export GGUF.
+    Merge {
+        /// Base model directory containing config.json, tokenizer.json, and .safetensors.
+        #[arg(long)]
+        base_dir: PathBuf,
+
+        /// LoRA adapter directory containing adapter_config.json and adapter .safetensors.
+        #[arg(long)]
+        lora_dir: PathBuf,
+
+        /// Destination directory for the merged model checkpoint.
+        #[arg(long, default_value = "artifacts/trained")]
+        out: PathBuf,
+
+        /// Manual scale factor overriding `adapter_config.json`.
+        #[arg(long)]
+        scale: Option<f64>,
+
+        /// Also export the merged model to GGUF.
+        #[arg(long)]
+        export_gguf: bool,
+
+        /// Destination path for GGUF output (defaults to `<out>/model.gguf`).
+        #[arg(long)]
+        gguf_output: Option<PathBuf>,
+
+        /// Model name string recorded in GGUF metadata.
+        #[arg(long, default_value = "llm-burner-merged")]
+        model_name: String,
+
+        /// Weight precision for load, compute, and safetensors export.
+        #[arg(long, default_value_t = Precision::F32)]
+        precision: Precision,
+
+        /// Device backend: `auto` uses GPU if available, `cpu` forces the CPU backend.
+        #[arg(long, default_value_t = DeviceChoice::Auto)]
+        device: DeviceChoice,
+    },
+
     /// Chat with a quantized GGUF model (CPU-only inference).
     Chat {
         /// Directory containing the exported `model.gguf`, `tokenizer.json`,
@@ -365,7 +404,7 @@ fn main() -> anyhow::Result<()> {
             // `--device gpu` refuses the CPU rung.
             #[cfg(feature = "gpu")]
             {
-                use llm_burner::probe::{BackendPlan, resolve_backend_plan};
+                use llm_burner::probe::{resolve_backend_plan, BackendPlan};
                 let plan = match device {
                     DeviceChoice::Cpu => {
                         log::info!("backend: Flex/CPU (`--device cpu`; skipping the GPU probe)");
