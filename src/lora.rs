@@ -18,7 +18,7 @@ use burn::module::Param;
 use burn::nn::Linear;
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Tensor};
-use burn_store::{ModuleStore, SafetensorsStore, TensorSnapshot};
+use burn_store::{SafetensorsStore, TensorSnapshot};
 
 use crate::config::TransformersConfig;
 use crate::data::TokenizerStore;
