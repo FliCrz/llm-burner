@@ -16,6 +16,7 @@ gpu-cuda = ["burn/wgpu", "burn/cuda", "burn/fusion", "burn/autotune", "burn/flex
 burn = { version = "0.21.0", default-features = false, features = ["std", "train", "dataset", "tui", "metrics", "store", "sqlite-bundled", "autodiff"] }
 burn-core = { version = "0.21.0", default-features = false, features = ["std"] }
 burn-store = { version = "0.21.0", default-features = false, features = ["std"] }
+safetensors = "0.7"
 rlx-gguf = "0.2.14"
 hf-hub = { version = "1.0", features = ["blocking"] }
 tokenizers = "0.21"

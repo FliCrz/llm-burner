@@ -7,6 +7,7 @@ pub mod data;
 pub mod export;
 pub mod generate;
 pub mod hf;
+pub mod lora;
 pub mod model;
 pub mod pipeline;
 pub mod probe;
