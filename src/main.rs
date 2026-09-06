@@ -10,6 +10,8 @@ use llm_burner::pipeline::{default_dataset_dir, default_model_dir, PipelineInput
 use llm_burner::probe::DeviceChoice;
 use llm_burner::qlora::LoraTrainConfig;
 use llm_burner::train::{Precision, TrainConfig};
+use ash::vk;
+use llm_burner::model::gguf::EmbeddedTokenizer;
 
 /// A simplified Gemma-family LLM fine-tuner for Burn.
 #[derive(Parser, Debug)]
@@ -260,18 +262,13 @@ enum Command {
     /// Chat with a quantized GGUF model (Vulkan-accelerated compute on
     /// Vulkan-capable machines, mmap CPU fallback otherwise).
     Chat {
-        /// Directory containing the exported `model.gguf`, with optional
-        /// `tokenizer.json`/`tokenizer_config.json` siblings; when they are
-        /// absent the tokenizer embedded in the GGUF is used (BPE models)
-        /// (use `--gguf`/`--tokenizer` to point at specific files elsewhere).
-        #[arg(long, default_value = "artifacts/trained")]
-        model_dir: PathBuf,
-
-        /// Explicit GGUF file (defaults to `<model_dir>/model.gguf`).
+        /// Path to the quantized `model.gguf` file. When no `--tokenizer` is
+        /// given, a sibling `tokenizer.json` is used if present, else the
+        /// GPT-2-style BPE tokenizer embedded in the GGUF.
         #[arg(long)]
-        gguf: Option<PathBuf>,
+        model: PathBuf,
 
-        /// Explicit tokenizer file (defaults to `<model_dir>/tokenizer.json`;
+        /// Explicit tokenizer file (defaults to `<model dir>/tokenizer.json`;
         /// optional when the GGUF embeds GPT-2-style BPE tokenizer metadata).
         #[arg(long)]
         tokenizer: Option<PathBuf>,
@@ -642,8 +639,7 @@ fn main() -> anyhow::Result<()> {
             dispatch_merge(&inputs, device)?;
         }
         Command::Chat {
-            model_dir,
-            gguf,
+            model,
             tokenizer,
             prompt,
             temperature,
@@ -653,7 +649,10 @@ fn main() -> anyhow::Result<()> {
         } => {
             // The REPL owns the terminal; keep log output out of the way by
             // piping it to a sibling `chat.log` like training does.
-            let log_path = model_dir.join("chat.log");
+            let log_path = model
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("chat.log");
             let _ = std::fs::remove_file(&log_path);
             let log_file = std::fs::OpenOptions::new()
                 .create(true)
@@ -665,20 +664,56 @@ fn main() -> anyhow::Result<()> {
                 .init();
             log::info!("logging to `{}`", log_path.display());
 
-            let gguf_path = gguf.unwrap_or_else(|| model_dir.join("model.gguf"));
+            let gguf_path = model;
             if !gguf_path.exists() {
                 anyhow::bail!("GGUF file not found: `{}`", gguf_path.display());
             }
-            let tokenizer_path = tokenizer.unwrap_or_else(|| model_dir.join("tokenizer.json"));
-            if !tokenizer_path.exists() {
-                anyhow::bail!(
-                    "tokenizer not found: `{}` (export it next to `model.gguf`)",
-                    tokenizer_path.display()
-                );
-            }
+            let tokenizer_path = tokenizer.unwrap_or_else(|| {                gguf_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("tokenizer.json")
+            });
 
-            let engine = llm_burner::model::gguf::GgufEngine::load(&gguf_path)?;
-            let tokenizer = llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?;
+let engine = llm_burner::model::gguf::GgufEngine::load(&gguf_path)?;
+// Report which backend is active (Vulkan or CPU fallback).
+#[cfg(feature = "infer-vk")]
+{
+    // The engine was loaded successfully; Vulkan availability was already
+    // checked at compile-time (feature gate).  We simply inform the user
+    // which path is active.
+    log::info!("Vulkan support enabled (compiled with --features infer-vk)");
+}
+#[cfg(not(feature = "infer-vk"))]
+{
+    log::info!("Vulkan support disabled (compile without --features infer-vk); using CPU fallback");
+}
+
+#[cfg(feature = "infer-vk")]
+{
+    // placeholder: Vulkan instance availability is checked at runtime;
+    // the actual dispatch logic lives in `choose_engine` / a dedicated
+    // `VulkanEngine` type.
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer reconstruction (GGUF metadata → BPE or file)
+// ---------------------------------------------------------------------------
+let tokenizer = if tokenizer_path.exists() {
+                llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?
+            } else {
+                match engine.embedded_tokenizer() {
+                    EmbeddedTokenizer::Bpe(tok) => llm_burner::data::TokenizerStore::clone(tok),
+                    EmbeddedTokenizer::None => anyhow::bail!(
+                        "no tokenizer found: `{}` (export `tokenizer.json` next to the GGUF)",
+                        tokenizer_path.display()
+                    ),
+                    EmbeddedTokenizer::LlamaOnly => anyhow::bail!(
+                        "`{}` embeds a SentencePiece tokenizer, which cannot yet be rebuilt \
+                         from GGUF metadata; export `tokenizer.json` next to it",
+                        gguf_path.display()
+                    ),
+                }
+            };
             let gen_cfg = llm_burner::generate::GenerateConfig {
                 max_tokens,
                 temperature,

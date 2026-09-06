@@ -143,7 +143,7 @@ GPT-2-style BPE models, whose tokenizer is already embedded in the GGUF as
 `tokenizer.ggml.*` metadata):
 
 ```bash
-cargo run --release -- chat
+cargo run --release -- chat --model ./artifacts/trained/model.gguf
 ```
 
 The prompt for each turn is rendered from the model's Jinja chat template
@@ -153,7 +153,7 @@ for the session. Extra flags:
 
 ```bash
 cargo run --release -- chat \
-  --model-dir ./artifacts/trained \
+  --model ./artifacts/trained/model.gguf \
   --temperature 0.8 --top-p 0.9 --max-tokens 512 \
   --prompt "What is llm-burner?"   # one-shot answer, then exit
 ```

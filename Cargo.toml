@@ -39,10 +39,10 @@ ash = { version = "0.38", optional = true }
 naga = { version = "30", optional = true, default-features = false, features = ["wgsl-in", "spv-out"] }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 memmap2 = "0.9"
+ahash = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-ahash = "0.8"

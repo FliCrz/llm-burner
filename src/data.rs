@@ -84,6 +84,7 @@ impl HfDataset {
 
 /// A loaded Hugging Face tokenizer, configured for fixed-length causal-LM
 /// windows with truncation on the right and right-side padding.
+#[derive(Clone)]
 pub struct TokenizerStore {
     tokenizer: Tokenizer,
     /// Padding token id (used as the target for the shifted last position).
@@ -168,6 +169,70 @@ impl TokenizerStore {
             seq_len: 0,
             chat_template,
             merges,
+        })
+    }
+
+    /// Rebuild a tokenizer from GGUF `tokenizer.ggml.*` metadata for the
+    /// GPT-2-style byte-level BPE layout (`tokenizer.ggml.model == "gpt2"`),
+    /// so `chat` needs no sibling `tokenizer.json`.
+    ///
+    /// `tokens[i]` is the vocab token holding id `i` (padded slots included,
+    /// as written by `crate::export::add_tokenizer_metadata`); `merges` are
+    /// `"a b"` merge rules. Special tokens are intentionally NOT re-registered
+    /// (their ids are fixed by their vocabulary positions, so re-adding them
+    /// would renumber ids and desync the model), which means decoding with
+    /// `skip_special_tokens` cannot strip them; callers stop at `eos_id`
+    /// instead. SentencePiece-family ("llama") GGUFs cannot be rebuilt from
+    /// what is currently exported and must keep a sibling `tokenizer.json`.
+    pub fn from_gguf(
+        tokens: &[String],
+        merges: &[String],
+        eos_id: u32,
+        pad_id: u32,
+        chat_template: Option<String>,
+    ) -> Result<Self> {
+        use tokenizers::decoders::{
+            DecoderWrapper, byte_level::ByteLevel as ByteLevelDecoder,
+        };
+        use tokenizers::models::bpe::{BpeBuilder, Merges};
+        use tokenizers::pre_tokenizers::{
+            PreTokenizerWrapper, byte_level::ByteLevel as ByteLevelPre,
+        };
+
+        let vocab: ahash::AHashMap<String, u32> = tokens
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), id as u32))
+            .collect();
+        let rules: Merges = merges
+            .iter()
+            .map(|m| {
+                m.split_once(' ')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .ok_or_else(|| anyhow::anyhow!("malformed GGUF merge rule `{m}`"))
+            })
+            .collect::<Result<_>>()?;
+
+        let model = BpeBuilder::new()
+            .byte_fallback(true)
+            .vocab_and_merges(vocab, rules)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build BPE tokenizer from GGUF metadata: {e}"))?;
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::ByteLevel(
+            ByteLevelPre::default(),
+        )));
+        tokenizer.with_decoder(Some(DecoderWrapper::ByteLevel(
+            ByteLevelDecoder::default(),
+        )));
+
+        Ok(Self {
+            tokenizer,
+            pad_id,
+            eos_id,
+            seq_len: 0,
+            chat_template,
+            merges: merges.to_vec(),
         })
     }
 
@@ -773,6 +838,114 @@ mod tests {
         // A tokenizer without merges (e.g. WordLevel) yields none.
         let store = word_pseudo_tokenizer();
         assert!(store.merges().is_empty());
+    }
+
+    /// The 256 byte tokens of GPT-2-style byte-level BPE, generated with the
+    /// same algorithm HF's `bytes_to_unicode` uses (the `tokenizers` crate's
+    /// `ByteLevel` pre-tokenizer encodes input with the identical table).
+    fn gpt2_byte_tokens() -> Vec<String> {
+        let mut keep: Vec<u8> = (33u8..=126).chain(161u8..=172).chain(174u8..=255).collect();
+        (0..=255u8)
+            .map(|b| {
+                if keep.contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    char::from_u32(b as u32 + 256).unwrap().to_string()
+                }
+            })
+            .collect()
+    }
+
+    /// A tiny GPT-2-style byte-level BPE tokenizer persisted to `tokenizer.json`.
+    /// Byte tokens hold ids 0-255; a few word tokens and merge rules on top.
+    fn bpe_token_store(dir: &tempfile::TempDir) -> TokenizerStore {
+        use tokenizers::decoders::DecoderWrapper;
+        use tokenizers::models::bpe::BpeBuilder;
+        use tokenizers::pre_tokenizers::{PreTokenizerWrapper, byte_level::ByteLevel};
+
+        let mut vocab: ahash::AHashMap<String, u32> = gpt2_byte_tokens()
+            .into_iter()
+            .enumerate()
+            .map(|(id, t)| (t, id as u32))
+            .collect();
+        for (t, id) in [
+            ("<|endoftext|>", 256u32),
+            ("hello", 257u32),
+            ("world", 258u32),
+            // Merge intermediates must exist as vocab entries too.
+            ("he", 259u32),
+            ("hel", 260u32),
+            ("hell", 261u32),
+        ] {
+            vocab.insert(t.to_string(), id);
+        }
+        let merges = [
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+            ("hel".to_string(), "l".to_string()),
+            ("hell".to_string(), "o".to_string()),
+        ]
+        .to_vec();
+
+        let model = BpeBuilder::new()
+            .vocab_and_merges(vocab, merges)
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::ByteLevel(
+            ByteLevel::default(),
+        )));
+        tokenizer.with_decoder(Some(DecoderWrapper::ByteLevel(ByteLevel::default())));
+        let dir = dir.as_ref();
+        let path = dir.join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_string(&tokenizer).unwrap()).unwrap();
+        TokenizerStore::from_file(&path).unwrap()
+    }
+
+    #[test]
+    fn gguf_bpe_rebuild_matches_original_tokenizer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = bpe_token_store(&dir);
+
+        // Positional convention: tokens[id] is the token with that id.
+        let mut positional = vec![String::new(); store.vocab_ordered().len()];
+        for (t, id) in store.vocab_ordered() {
+            positional[id as usize] = t;
+        }
+
+        let rebuilt = TokenizerStore::from_gguf(
+            &positional,
+            store.merges(),
+            store.eos_id,
+            store.pad_id,
+            store.chat_template.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(rebuilt.merges(), store.merges());
+        assert_eq!(rebuilt.eos_id, store.eos_id);
+        assert_eq!(rebuilt.pad_id, store.pad_id);
+        assert_eq!(rebuilt.vocab_ordered(), store.vocab_ordered());
+
+        // Encodings must be id-for-id identical, and decoding must round-trip.
+        for text in [
+            "hello",
+            "hello hello",
+            "world",
+            "hi!",
+            "café",
+            "ność 日本語",
+        ] {
+            let a = store.encode_raw(text).unwrap();
+            let b = rebuilt.encode_raw(text).unwrap();
+            assert_eq!(a, b, "encode mismatch for {text:?}");
+            assert_eq!(store.decode(&a, true).unwrap(), rebuilt.decode(&b, true).unwrap());
+        }
+        // The merged word token is reachable in both.
+        assert_eq!(
+            store.encode_raw("hello").unwrap(),
+            rebuilt.encode_raw("hello").unwrap()
+        );
     }
 
     #[test]
