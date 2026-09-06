@@ -10,7 +10,6 @@ use llm_burner::pipeline::{default_dataset_dir, default_model_dir, PipelineInput
 use llm_burner::probe::DeviceChoice;
 use llm_burner::qlora::LoraTrainConfig;
 use llm_burner::train::{Precision, TrainConfig};
-use ash::vk;
 use llm_burner::model::gguf::EmbeddedTokenizer;
 
 /// A simplified Gemma-family LLM fine-tuner for Burn.
@@ -675,25 +674,9 @@ fn main() -> anyhow::Result<()> {
             });
 
 let engine = llm_burner::model::gguf::GgufEngine::load(&gguf_path)?;
-// Report which backend is active (Vulkan or CPU fallback).
-#[cfg(feature = "infer-vk")]
-{
-    // The engine was loaded successfully; Vulkan availability was already
-    // checked at compile-time (feature gate).  We simply inform the user
-    // which path is active.
-    log::info!("Vulkan support enabled (compiled with --features infer-vk)");
-}
-#[cfg(not(feature = "infer-vk"))]
-{
-    log::info!("Vulkan support disabled (compile without --features infer-vk); using CPU fallback");
-}
-
-#[cfg(feature = "infer-vk")]
-{
-    // placeholder: Vulkan instance availability is checked at runtime;
-    // the actual dispatch logic lives in `choose_engine` / a dedicated
-    // `VulkanEngine` type.
-}
+log::info!(
+    "using CPU GGUF engine; Vulkan integration is not selected in this chat path"
+);
 
 // ---------------------------------------------------------------------------
 // Tokenizer reconstruction (GGUF metadata → BPE or file)
@@ -702,7 +685,7 @@ let tokenizer = if tokenizer_path.exists() {
                 llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?
             } else {
                 match engine.embedded_tokenizer() {
-                    EmbeddedTokenizer::Bpe(tok) => llm_burner::data::TokenizerStore::clone(tok),
+                    EmbeddedTokenizer::Bpe(tok) => tok.clone(),
                     EmbeddedTokenizer::None => anyhow::bail!(
                         "no tokenizer found: `{}` (export `tokenizer.json` next to the GGUF)",
                         tokenizer_path.display()

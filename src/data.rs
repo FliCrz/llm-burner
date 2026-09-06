@@ -660,13 +660,26 @@ pub fn collect_qa_files(dir: &Path) -> Vec<PathBuf> {
 pub fn parse_qa_json(path: &Path) -> Result<Vec<QaRecord>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read `{}`", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("`{}` is neither a JSON array nor JSONL", path.display()))?;
 
-    let entries: Vec<serde_json::Value> = match &value {
-        serde_json::Value::Array(rows) => rows.clone(),
-        _ => {
-            // JSONL fallback: one object per line.
+    let entries: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(&raw).ok() {
+        Some(value) => match value {
+            serde_json::Value::Array(rows) => rows,
+            _ => {
+                let mut rows = Vec::new();
+                for (i, line) in raw.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let row: serde_json::Value = serde_json::from_str(line).with_context(|| {
+                        format!("line {} of `{}` is not valid JSON", i + 1, path.display())
+                    })?;
+                    rows.push(row);
+                }
+                rows
+            }
+        },
+        None => {
             let mut rows = Vec::new();
             for (i, line) in raw.lines().enumerate() {
                 let line = line.trim();

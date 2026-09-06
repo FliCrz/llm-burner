@@ -498,7 +498,7 @@ where
     // freeze the base weights so gradients and optimizer state touch only the
     // adapters. (`freeze_base` also keeps embeddings/norms frozen.)
     if let Some(lora) = inputs.train.lora.clone() {
-        let device = Default::default();
+        let device = model.model.embed_tokens.weight.val().device();
         log::info!(
             "injecting LoRA adapters (r={}, alpha={}, dropout={})",
             lora.rank,

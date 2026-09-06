@@ -106,13 +106,11 @@ impl<B: Backend> LoraLinear<B> {
         let [d_input, d_output] = self.weight.val().dims();
         let zeros = |shape: [usize; 2]| Tensor::<B, 2>::zeros(shape, device);
 
-        self.lora_A = Some(Param::from_tensor(
-            initializer.init_with(
-                [rank, d_input],
-                Some(d_input),
-                Some(d_output),
-                device,
-            ).val(),
+        self.lora_A = Some(initializer.init_with(
+            [rank, d_input],
+            Some(d_input),
+            Some(rank),
+            device,
         ));
         self.lora_B = Some(Param::from_tensor(zeros([d_output, rank])));
         self.lora_scale = (lora_alpha / rank as f64) as f32;
