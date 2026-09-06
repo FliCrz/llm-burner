@@ -3,15 +3,97 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::model::model::LlmModel;
 
 use anyhow::{Context, Result};
-use burn::tensor::{DType, backend::Backend};
+use burn::tensor::shape;
+use burn::tensor::{DType, TensorData, backend::Backend};
 use burn_store::{
     BurnToPyTorchAdapter, ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter,
     SafetensorsStore, TensorSnapshot,
 };
+
+/// Linear-like container types whose 2D `weight` is stored `[out, in]` in
+/// PyTorch checkpoints and `[in, out]` in Burn, and must be transposed between
+/// the two.
+const TRANSPOSING_MODULE_TYPES: [&str; 2] = ["Struct:Linear", "Struct:LoraLinear"];
+
+/// `burn-store`'s [`PyTorchToBurnAdapter`] transposes linear weights only when
+/// the container stringifies to `Struct:Linear`. Since this crate replaces
+/// every `Linear` with a [`crate::model::lora::LoraLinear`] (even when LoRA is
+/// disabled at load time), the adapter must also transpose those weights or the
+/// `[out, in]` checkpoint shards fail to match the model's `[in, out]` shape.
+///
+/// The transpose is symmetric (it only flips both axes of a 2D `weight`), so the
+/// same adapter is used on both the load (`PyTorch -> Burn`) and save
+/// (`Burn -> PyTorch`) paths; the direction-specific `burn_store` adapters still
+/// handle norm renames and anything else.
+#[derive(Debug, Clone, Default)]
+pub struct LoraLinearAdapter;
+
+impl ModuleAdapter for LoraLinearAdapter {
+    fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
+        let module_type = match snapshot.module_type() {
+            Some(mt) => mt,
+            None => return snapshot.clone(),
+        };
+        let is_transposing =
+            TRANSPOSING_MODULE_TYPES.iter().any(|&t| t == module_type);
+        let is_weight = snapshot
+            .path_stack
+            .as_ref()
+            .and_then(|p| p.last())
+            .map(|n| n == "weight")
+            .unwrap_or(false);
+        if !is_transposing || !is_weight || snapshot.shape.len() != 2 {
+            return snapshot.clone();
+        }
+        transpose_2d(snapshot)
+    }
+
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
+        Box::new(self.clone())
+    }
+}
+
+/// Transpose a 2D tensor snapshot in place (Burn row-major `[in, out]` <-> the
+/// PyTorch `[out, in]` layout). Mirrors `burn_store`'s private byte-level
+/// transpose.
+fn transpose_2d(snapshot: &TensorSnapshot) -> TensorSnapshot {
+    let original_data_fn = snapshot.clone_data_fn();
+    let dtype = snapshot.dtype;
+    let transposed_shape = shape![snapshot.shape[1], snapshot.shape[0]];
+    let data_fn = Rc::new(move || {
+        let data = original_data_fn()?;
+        Ok(transpose_data(data))
+    });
+    TensorSnapshot::from_closure(
+        data_fn,
+        dtype,
+        transposed_shape,
+        snapshot.path_stack.clone().unwrap_or_default(),
+        snapshot.container_stack.clone().unwrap_or_default(),
+        snapshot.tensor_id.unwrap_or_default(),
+    )
+}
+
+fn transpose_data(data: TensorData) -> TensorData {
+    let rows = data.shape[0];
+    let cols = data.shape[1];
+    let bytes = data.as_bytes();
+    let element_size = data.dtype.size();
+    let mut out = vec![0u8; bytes.len()];
+    for i in 0..rows {
+        for j in 0..cols {
+            let src = (i * cols + j) * element_size;
+            let dst = (j * rows + i) * element_size;
+            out[dst..dst + element_size].copy_from_slice(&bytes[src..src + element_size]);
+        }
+    }
+    TensorData::from_bytes_vec(out, vec![cols, rows], data.dtype)
+}
 
 /// Adapter that casts floating-point tensors to a target dtype.
 #[derive(Debug, Clone)]
@@ -74,6 +156,7 @@ pub fn load_from_safetensors<B: Backend>(
     // arbitrary number of shards scales the startup cost linearly with the
     // shard count), which the heavy models this loader targets pay for twice.
     let adapter: Box<dyn ModuleAdapter> = FloatDTypeAdapter::new(target_dtype)
+        .chain(LoraLinearAdapter)
         .chain(PyTorchToBurnAdapter)
         .clone_box();
 
@@ -84,6 +167,12 @@ pub fn load_from_safetensors<B: Backend>(
             .get_all_snapshots()
             .with_context(|| format!("failed to parse weights from `{}`", path.display()))?;
         for (name, snapshot) in shard_snapshots {
+            // PEFT adapter tensors (`lora_A`/`lora_B`) have no matching base
+            // parameter; feeding them to the base model only pollutes the load
+            // (or, worse, looks like a plausible full checkpoint of zeros).
+            if name.ends_with(".lora_A.weight") || name.ends_with(".lora_B.weight") {
+                continue;
+            }
             merged.insert(name.clone(), snapshot.clone());
         }
     }
@@ -153,7 +242,9 @@ pub fn checkpoint_dtype(shards: &[&Path]) -> Result<(DType, usize)> {
 /// loadable by PyTorch / transformers and retrainable by Burn.
 pub fn save_to_safetensors<B: Backend>(model: &LlmModel<B>, path: &Path) -> Result<()> {
     let mut store = SafetensorsStore::from_file(path)
-        .with_to_adapter(BurnToPyTorchAdapter)
+        .with_to_adapter(
+            LoraLinearAdapter.chain(BurnToPyTorchAdapter),
+        )
         .overwrite(true);
     store
         .collect_from(model)
@@ -171,7 +262,11 @@ mod tests {
 
     fn save_with_float_dtype(model: &LlmModel<B>, path: &Path, dtype: DType) {
         let mut store = SafetensorsStore::from_file(path)
-            .with_to_adapter(FloatDTypeAdapter::new(dtype).chain(BurnToPyTorchAdapter))
+            .with_to_adapter(
+                LoraLinearAdapter
+                    .chain(FloatDTypeAdapter::new(dtype))
+                    .chain(BurnToPyTorchAdapter),
+            )
             .overwrite(true);
         store.collect_from(model).unwrap();
     }

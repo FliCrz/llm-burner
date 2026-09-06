@@ -1,8 +1,8 @@
+use super::lora::LoraLinear;
 use super::rms_norm::RmsNorm;
 use super::rope;
 
 use burn::module::{Initializer, Module};
-use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::softmax;
 use burn::tensor::{Bool, Int, Tensor, backend::Backend};
 
@@ -41,13 +41,13 @@ impl<B: Backend> LayerKv<B> {
 #[derive(Module, Debug)]
 pub struct CausalAttention<B: Backend> {
     /// Query projection, `hidden -> n_heads * head_dim`.
-    pub q_proj: Linear<B>,
+    pub q_proj: LoraLinear<B>,
     /// Key projection, `hidden -> n_kv_heads * head_dim`.
-    pub k_proj: Linear<B>,
+    pub k_proj: LoraLinear<B>,
     /// Value projection, `hidden -> n_kv_heads * head_dim`.
-    pub v_proj: Linear<B>,
+    pub v_proj: LoraLinear<B>,
     /// Output projection, `n_heads * head_dim -> hidden`.
-    pub o_proj: Linear<B>,
+    pub o_proj: LoraLinear<B>,
     /// Optional per-head query norm (Gemma 2/3).
     pub q_norm: Option<RmsNorm<B>>,
     /// Optional per-head key norm (Gemma 2/3).
@@ -118,18 +118,27 @@ impl<B: Backend> CausalAttention<B> {
         // Only the Q/K/V projections take a bias (and only for some
         // architectures, e.g. Qwen2); the output projection never does.
         // Biases are zero-initialized, matching Hugging Face.
-        let mut q_proj = LinearConfig::new(hidden_size, n_heads * head_dim)
-            .with_bias(qkv_bias)
-            .with_initializer(initializer.clone())
-            .init(device);
-        let mut k_proj = LinearConfig::new(hidden_size, n_kv_heads * head_dim)
-            .with_bias(qkv_bias)
-            .with_initializer(initializer.clone())
-            .init(device);
-        let mut v_proj = LinearConfig::new(hidden_size, n_kv_heads * head_dim)
-            .with_bias(qkv_bias)
-            .with_initializer(initializer.clone())
-            .init(device);
+        let mut q_proj = LoraLinear::init(
+            hidden_size,
+            n_heads * head_dim,
+            qkv_bias,
+            initializer.clone(),
+            device,
+        );
+        let mut k_proj = LoraLinear::init(
+            hidden_size,
+            n_kv_heads * head_dim,
+            qkv_bias,
+            initializer.clone(),
+            device,
+        );
+        let mut v_proj = LoraLinear::init(
+            hidden_size,
+            n_kv_heads * head_dim,
+            qkv_bias,
+            initializer.clone(),
+            device,
+        );
         if qkv_bias {
             for proj in [&mut q_proj, &mut k_proj, &mut v_proj] {
                 let out_dim = proj.bias.as_ref().unwrap().val().dims()[0];
@@ -139,10 +148,13 @@ impl<B: Backend> CausalAttention<B> {
                 }
             }
         }
-        let o_proj = LinearConfig::new(n_heads * head_dim, hidden_size)
-            .with_bias(false)
-            .with_initializer(initializer)
-            .init(device);
+        let o_proj = LoraLinear::init(
+            n_heads * head_dim,
+            hidden_size,
+            false,
+            initializer,
+            device,
+        );
 
         let q_norm = if has_qk_norm {
             Some(RmsNorm::new(head_dim, rms_eps, device))

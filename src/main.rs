@@ -8,6 +8,7 @@ use llm_burner::data::HfDataset;
 use llm_burner::hf::HfRepo;
 use llm_burner::pipeline::{default_dataset_dir, default_model_dir, PipelineInputs};
 use llm_burner::probe::DeviceChoice;
+use llm_burner::qlora::LoraTrainConfig;
 use llm_burner::train::{Precision, TrainConfig};
 
 /// A simplified Gemma-family LLM fine-tuner for Burn.
@@ -84,6 +85,25 @@ enum Command {
         /// AdamW weight decay.
         #[arg(long, default_value_t = 0.1)]
         weight_decay: f64,
+
+        /// Train rank-`r` LoRA adapters over frozen base weights instead of a
+        /// full fine-tune (QLoRA-style: gradients and optimizer state touch
+        /// only the adapters). The run exports both a PEFT `adapter_*` pair
+        /// and the ordinary merged safetensors/GGUF checkpoint.
+        #[arg(long)]
+        lora: bool,
+
+        /// LoRA rank `r` (used when `--lora` is set).
+        #[arg(long, default_value_t = 8)]
+        lora_r: usize,
+
+        /// LoRA alpha; the adapter branch is scaled by `lora_alpha / r`.
+        #[arg(long, default_value_t = 16.0)]
+        lora_alpha: f64,
+
+        /// LoRA dropout probability applied to the adapter branch (training).
+        #[arg(long, default_value_t = 0.0)]
+        lora_dropout: f64,
 
         /// Disable the Ratatui progress dashboard (useful for testing and
         /// non-interactive runs); progress goes to the log file instead.
@@ -311,6 +331,7 @@ fn main() -> anyhow::Result<()> {
                     "*.txt".to_string(),
                     "*.text".to_string(),
                     "*.md".to_string(),
+                    "*.json".to_string(),
                     "*.jsonl".to_string(),
                 ],
                 &[],
@@ -333,6 +354,10 @@ fn main() -> anyhow::Result<()> {
             no_tui,
             precision,
             device,
+            lora,
+            lora_r,
+            lora_alpha,
+            lora_dropout,
             ablate_refusal,
             refusal_layer,
             ablate_scale,
@@ -381,6 +406,11 @@ fn main() -> anyhow::Result<()> {
                     weight_decay,
                     log_every: (steps / 20).max(1),
                     precision,
+                    lora: lora.then_some(LoraTrainConfig {
+                        rank: lora_r,
+                        alpha: lora_alpha,
+                        dropout: lora_dropout,
+                    }),
                     tui: !no_tui,
                     output_redirect: Some(log_path.clone()),
                     run_info: Default::default(),
@@ -491,9 +521,10 @@ fn main() -> anyhow::Result<()> {
             }
             let tokenizer = llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?;
 
-            let shards = llm_burner::hf::classify_download(&model_dir)?;
+            let download = llm_burner::hf::classify_download(&model_dir)?;
+            let shards = llm_burner::hf::base_shards(&download)?;
             let shards_refs: Vec<&std::path::Path> =
-                shards.safetensors.iter().map(PathBuf::as_path).collect();
+                shards.iter().map(PathBuf::as_path).collect();
             if shards_refs.is_empty() {
                 anyhow::bail!(
                     "no `.safetensors` weights found in `{}`",
@@ -856,9 +887,10 @@ fn run_generate<B: burn::tensor::backend::Backend>(
     }
     let tokenizer = llm_burner::data::TokenizerStore::from_file(&tokenizer_path)?;
 
-    let shards = llm_burner::hf::classify_download(model_dir)?;
+    let download = llm_burner::hf::classify_download(model_dir)?;
+    let shards = llm_burner::hf::base_shards(&download)?;
     let shards_refs: Vec<&std::path::Path> =
-        shards.safetensors.iter().map(PathBuf::as_path).collect();
+        shards.iter().map(PathBuf::as_path).collect();
     if shards_refs.is_empty() {
         anyhow::bail!(
             "no `.safetensors` weights found in `{}`",
@@ -927,6 +959,7 @@ fn resolve_inputs(
                     "*.txt".to_string(),
                     "*.text".to_string(),
                     "*.md".to_string(),
+                    "*.json".to_string(),
                     "*.jsonl".to_string(),
                 ],
                 &[],

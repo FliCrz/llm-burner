@@ -7,10 +7,14 @@ description = "Download Hugging Face models, fine-tune a Gemma-style transformer
 [features]
 # GPU (wgpu/Vulkan) is the default training backend. Build with
 # `--no-default-features --features flex` for a CPU-only binary.
-default = ["gpu"]
+default = ["gpu", "infer-vk"]
 flex = ["burn/flex", "burn/simd", "burn/autotune"]
 gpu = ["burn/wgpu", "burn/vulkan", "burn/fusion", "burn/autotune", "burn/flex", "burn/simd"]
 gpu-cuda = ["burn/wgpu", "burn/cuda", "burn/fusion", "burn/autotune", "burn/flex"]
+# Raw Vulkan compute backend for the quantized GGUF chat engine (`infer::vk`),
+# independent of the Burn training stack. The CPU `GgufEngine` stays compiled
+# as the automatic fallback when no Vulkan device can be initialized.
+infer-vk = ["dep:ash", "dep:naga", "dep:bytemuck"]
 
 [dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["std", "train", "dataset", "tui", "metrics", "store", "sqlite-bundled", "autodiff"] }
@@ -31,6 +35,10 @@ env_logger = "0.11"
 ratatui = { version = "0.30", features = ["all-widgets", "crossterm"] }
 half = "2"
 minijinja = "2"
+ash = { version = "0.38", optional = true }
+naga = { version = "30", optional = true, default-features = false, features = ["wgsl-in", "spv-out"] }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+memmap2 = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

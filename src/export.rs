@@ -409,7 +409,9 @@ pub fn export_safetensors<B: burn::tensor::backend::Backend>(
 ) -> Result<()> {
     let mut store = SafetensorsStore::from_file(path)
         .with_to_adapter(
-            FloatDTypeAdapter::new(precision.safetensors_dtype()).chain(BurnToPyTorchAdapter),
+            crate::model::load::LoraLinearAdapter.chain(
+                FloatDTypeAdapter::new(precision.safetensors_dtype()).chain(BurnToPyTorchAdapter),
+            ),
         )
         .overwrite(true);
     store

@@ -566,6 +566,145 @@ pub fn collect_text_files(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     out
 }
 
+/// One question/answer pair extracted from a QA or DPO dataset file.
+#[derive(Debug, Clone)]
+pub struct QaRecord {
+    /// The user question.
+    pub question: String,
+    /// The chosen (preferred) assistant answer.
+    pub chosen: String,
+}
+
+/// Extensions probed for QA/DPO records. These take precedence over the plain
+/// text path when present: records are rendered into chat-formatted text and
+/// each becomes its own training window, instead of being glued into one
+/// token stream.
+pub const QA_EXTENSIONS: [&str; 2] = ["json", "jsonl"];
+
+/// Recursively collect QA/DPO data files under `dir`.
+pub fn collect_qa_files(dir: &Path) -> Vec<PathBuf> {
+    collect_text_files(dir, &QA_EXTENSIONS)
+}
+
+/// Parse a QA/DPO file into question/answer records.
+///
+/// Accepts either a JSON array of objects or JSONL (one object per line).
+/// Every object needs a question (`question` or `prompt`) and a chosen answer
+/// (`chosen_answer`, `chosen`, or `answer`); records missing either are
+/// skipped so mixed-bag files (DPO rejects, metadata rows) still load.
+pub fn parse_qa_json(path: &Path) -> Result<Vec<QaRecord>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read `{}`", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("`{}` is neither a JSON array nor JSONL", path.display()))?;
+
+    let entries: Vec<serde_json::Value> = match &value {
+        serde_json::Value::Array(rows) => rows.clone(),
+        _ => {
+            // JSONL fallback: one object per line.
+            let mut rows = Vec::new();
+            for (i, line) in raw.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let row: serde_json::Value = serde_json::from_str(line).with_context(|| {
+                    format!("line {} of `{}` is not valid JSON", i + 1, path.display())
+                })?;
+                rows.push(row);
+            }
+            rows
+        }
+    };
+
+    let field = |obj: &serde_json::Map<String, serde_json::Value>, names: &[&str]| -> Option<String> {
+        names
+            .iter()
+            .find_map(|n| obj.get(*n))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+
+    let mut out = Vec::new();
+    for row in &entries {
+        let serde_json::Value::Object(obj) = row else {
+            continue;
+        };
+        let Some(question) = field(obj, &["question", "prompt"]) else {
+            continue;
+        };
+        let Some(chosen) = field(obj, &["chosen_answer", "chosen", "answer"]) else {
+            continue;
+        };
+        if !question.is_empty() && !chosen.is_empty() {
+            out.push(QaRecord { question, chosen });
+        }
+    }
+    Ok(out)
+}
+
+/// Load all QA/DPO records under `dir` (concatenating `.json` + `.jsonl` files).
+pub fn load_qa_corpus(dir: &Path) -> Result<Vec<QaRecord>> {
+    let mut records = Vec::new();
+    for path in collect_qa_files(dir) {
+        records.extend(parse_qa_json(&path)?);
+    }
+    Ok(records)
+}
+
+/// Render one QA pair as the training text: the model's chat template with the
+/// assistant reply included (`add_generation_prompt` off). Falls back to a
+/// plain `Q: ... / A: ...` block when the tokenizer has no template.
+pub fn render_qa_text(template: Option<&str>, record: &QaRecord) -> Result<String> {
+    use crate::chat::{ChatMessage, render_chat_template};
+    match template {
+        Some(tpl) => render_chat_template(
+            tpl,
+            &[
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: record.question.clone(),
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: record.chosen.clone(),
+                },
+            ],
+            false,
+        ),
+        None => Ok(format!("Q: {}\nA: {}", record.question, record.chosen)),
+    }
+}
+
+/// Tokenize rendered QA blocks into fixed-length windows, one per record
+/// (each block is its own training example, padded to `seq_len` on the right).
+///
+/// Returns the window arena and the total number of non-padding tokens.
+pub fn tokenize_qa_texts(
+    tokenizer: &TokenizerStore,
+    records: &[QaRecord],
+    template: Option<&str>,
+    seq_len: usize,
+    pad_id: u32,
+) -> Result<(WindowStore, usize)> {
+    if records.is_empty() {
+        return Ok((WindowStore::new(seq_len), 0));
+    }
+    let texts: Vec<String> = records
+        .iter()
+        .map(|r| render_qa_text(template, r))
+        .collect::<Result<_>>()?;
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+    let mut store = WindowStore::new(seq_len);
+    let mut total = 0usize;
+    for row in tokenizer.encode_batch(&refs)? {
+        total += row.iter().take_while(|&&t| t != pad_id).count();
+        store.extend_windows(&row);
+    }
+    Ok((store, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +773,41 @@ mod tests {
         // A tokenizer without merges (e.g. WordLevel) yields none.
         let store = word_pseudo_tokenizer();
         assert!(store.merges().is_empty());
+    }
+
+    #[test]
+    fn parses_qa_records_and_tokenizes_to_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dataset_dpo.json");
+        // DPO-style array with an ignorable rejected field and a partial row.
+        std::fs::write(
+            &path,
+            r#"[
+                {"question": "What is a goroutine?", "chosen_answer": "A lightweight thread.", "rejected_answer": "A big one."},
+                {"question": "How do you create a channel?", "chosen_answer": "With the make function."},
+                {"id": 1}
+            ]"#,
+        )
+        .unwrap();
+
+        let records = parse_qa_json(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].question, "What is a goroutine?");
+        assert_eq!(records[0].chosen, "A lightweight thread.");
+        assert_eq!(records[1].chosen, "With the make function.");
+
+        let template = Some(
+            "{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% endfor %}",
+        );
+        let first = render_qa_text(template, &records[0]).unwrap();
+        assert!(
+            first.contains("<user>What is a goroutine?</user>"),
+            "{first}"
+        );
+        assert!(
+            first.contains("<assistant>A lightweight thread.</assistant>"),
+            "{first}"
+        );
     }
 
     #[test]

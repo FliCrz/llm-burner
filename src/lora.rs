@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use burn::module::Param;
-use burn::nn::Linear;
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Tensor};
 use burn_store::{ModuleStore, SafetensorsStore, TensorSnapshot};
@@ -23,8 +22,9 @@ use burn_store::{ModuleStore, SafetensorsStore, TensorSnapshot};
 use crate::config::TransformersConfig;
 use crate::data::TokenizerStore;
 use crate::export::{export_gguf, export_safetensors};
-use crate::hf::classify_download;
+use crate::hf::{base_shards, classify_download};
 use crate::model::{LlmModel, LlmModelConfig};
+use crate::model::lora::LoraLinear;
 use crate::train::Precision;
 
 /// Deserialized Hugging Face PEFT `adapter_config.json`.
@@ -281,11 +281,11 @@ pub fn load_lora_snapshots(
     Ok(snapshots)
 }
 
-/// Helper to get a mutable reference to a `Linear` layer by its canonical path.
+/// Helper to get a mutable reference to a [`LoraLinear`] by its canonical path.
 fn get_linear_mut<'a, B: Backend>(
     model: &'a mut LlmModel<B>,
     module_path: &str,
-) -> Option<&'a mut Linear<B>> {
+) -> Option<&'a mut LoraLinear<B>> {
     let parts: Vec<&str> = module_path.split('.').collect();
     match parts.as_slice() {
         ["lm_head"] | ["model", "lm_head"] => model.lm_head.as_mut(),
@@ -599,7 +599,7 @@ pub fn run_merge<B: Backend>(
     }
     let tokenizer = TokenizerStore::from_file(&tokenizer_path)?;
 
-    let shards = classify_download(&inputs.base_dir)?.safetensors;
+    let shards = base_shards(&classify_download(&inputs.base_dir)?)?;
     if shards.is_empty() {
         bail!(
             "no `.safetensors` weights found in `{}`",

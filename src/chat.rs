@@ -24,9 +24,16 @@ pub struct ChatMessage {
 }
 
 /// Render `messages` with a Hugging Face-style Jinja chat template (the value
-/// of `tokenizer_config.json`'s `chat_template`). `add_generation_prompt` is
-/// set so the output ends where the assistant should start speaking.
-pub fn render_chat_template(template: &str, messages: &[ChatMessage]) -> Result<String> {
+/// of `tokenizer_config.json`'s `chat_template`).
+///
+/// With `add_generation_prompt`, the output ends where the assistant should
+/// start speaking (inference). Without it, the assistant reply itself is part
+/// of the messages and is emitted verbatim (fine-tuning targets).
+pub fn render_chat_template(
+    template: &str,
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+) -> Result<String> {
     let mut env = Environment::new();
     env.add_template("chat", template)
         .map_err(|e| anyhow::anyhow!("failed to compile chat template: {e}"))?;
@@ -39,7 +46,7 @@ pub fn render_chat_template(template: &str, messages: &[ChatMessage]) -> Result<
         .collect();
     let ctx = Value::from_serialize(serde_json::json!({
         "messages": msg_values,
-        "add_generation_prompt": true,
+        "add_generation_prompt": add_generation_prompt,
         // Some templates interpolate token placeholders; offer them as empty
         // strings so those render instead of hard-failing on `UndefinedError`.
         "bos_token": "",
@@ -92,7 +99,7 @@ impl GgufChat {
         });
 
         let prompt = match &self.tokenizer.chat_template {
-            Some(tpl) => render_chat_template(tpl, &self.messages)?,
+            Some(tpl) => render_chat_template(tpl, &self.messages, true)?,
             None => {
                 let mut s = String::new();
                 for m in &self.messages {
@@ -211,7 +218,7 @@ pub fn repl(chat: &mut GgufChat) -> Result<()> {
             content: input.to_string(),
         });
         let prompt = match &chat.tokenizer.chat_template {
-            Some(tpl) => render_chat_template(tpl, &chat.messages)?,
+            Some(tpl) => render_chat_template(tpl, &chat.messages, true)?,
             None => {
                 let mut s = String::new();
                 for m in &chat.messages {
@@ -298,6 +305,7 @@ mod tests {
                     content: "hi".into(),
                 },
             ],
+            true,
         )
         .unwrap();
         assert!(rendered.contains("<user>hi</user>"), "{rendered}");

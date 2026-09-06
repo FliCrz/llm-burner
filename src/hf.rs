@@ -99,8 +99,14 @@ pub struct HfDownload {
     pub dir: PathBuf,
     /// Path to `config.json`, if present.
     pub config_file: Option<PathBuf>,
-    /// Paths to all `.safetensors` weight files (sorted).
+    /// Paths to all `.safetensors` base-weight files (sorted). PEFT
+    /// `adapter_model.safetensors` files are *not* base-weight shards and are
+    /// reported separately via [`HfDownload::adapter`].
     pub safetensors: Vec<PathBuf>,
+    /// Path to a PEFT LoRA `adapter_model.safetensors`, if present. Adapters
+    /// hold only `lora_A`/`lora_B`; feeding them to the base checkpoint loader
+    /// fails with hundreds of "missing tensor" errors.
+    pub adapter: Option<PathBuf>,
     /// Tokenizer-related files (sorted).
     pub tokenizer_files: Vec<PathBuf>,
 }
@@ -138,12 +144,17 @@ pub fn classify_download(dir: &Path) -> Result<HfDownload> {
     let mut safetensors = Vec::new();
     let mut tokenizer_files = Vec::new();
     let mut config_file = None;
+    let mut adapter = None;
 
     for rel in walk_files(dir)? {
         let path = dir.join(&rel);
         let lower = rel.to_ascii_lowercase();
         if rel == "config.json" {
             config_file = Some(path);
+        } else if lower == "adapter_model.safetensors" {
+            // A PEFT adapter is *not* a base checkpoint: loading it as one
+            // reports every base tensor as missing. Report it separately.
+            adapter = Some(path);
         } else if lower.ends_with(".safetensors") {
             safetensors.push(path);
         } else if is_tokenizer_file(&lower) {
@@ -155,8 +166,30 @@ pub fn classify_download(dir: &Path) -> Result<HfDownload> {
         dir: dir.to_path_buf(),
         config_file,
         safetensors,
+        adapter,
         tokenizer_files,
     })
+}
+
+/// Resolve the base-weight shard list of a directory, producing a targeted
+/// error when it holds only a LoRA adapter instead of a full checkpoint.
+pub fn base_shards(download: &HfDownload) -> Result<Vec<PathBuf>> {
+    if !download.safetensors.is_empty() {
+        return Ok(download.safetensors.clone());
+    }
+    if let Some(adapter) = &download.adapter {
+        anyhow::bail!(
+            "`{}` contains only a LoRA adapter (`{}`), not a full checkpoint; \
+             point `--model-dir` at the base model directory, or merge the \
+             adapter into the base weights first",
+            download.dir.display(),
+            adapter.display()
+        );
+    }
+    anyhow::bail!(
+        "no `.safetensors` weights found in `{}`",
+        download.dir.display()
+    );
 }
 
 fn is_tokenizer_file(lower_rel: &str) -> bool {
@@ -223,5 +256,46 @@ mod tests {
         assert!(download.config_file.is_none());
         assert!(download.safetensors.is_empty());
         assert!(download.tokenizer_files.is_empty());
+    }
+
+    /// A PEFT `adapter_model.safetensors` must never be treated as a
+    /// base-weight shard (it holds only `lora_A`/`lora_B`), and an
+    /// adapter-only directory must produce a targeted error rather than
+    /// meaningless "missing tensor" failures.
+    #[test]
+    fn classifier_separates_lora_adapter_from_base_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("adapter_model.safetensors"), "w").unwrap();
+        std::fs::write(root.join("adapter_config.json"), "{}").unwrap();
+
+        let download = classify_download(root).unwrap();
+        assert!(
+            download.safetensors.is_empty(),
+            "adapter must not be a base shard"
+        );
+        assert_eq!(
+            download.adapter,
+            Some(root.join("adapter_model.safetensors"))
+        );
+
+        let err = base_shards(&download).unwrap_err().to_string();
+        assert!(err.contains("only a LoRA adapter"), "{err}");
+        assert!(err.contains("base model"), "{err}");
+    }
+
+    /// Base shards resolve normally when a full checkpoint and an adapter
+    /// co-exist (the trained-output directory layout).
+    #[test]
+    fn base_shards_ignores_coexisting_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("adapter_model.safetensors"), "w").unwrap();
+        std::fs::write(root.join("model.safetensors"), "w").unwrap();
+
+        let download = classify_download(root).unwrap();
+        let shards = base_shards(&download).unwrap();
+        assert_eq!(shards, vec![root.join("model.safetensors")]);
+        assert_eq!(download.adapter, Some(root.join("adapter_model.safetensors")));
     }
 }

@@ -1,9 +1,10 @@
 use super::attention::LayerKv;
 use super::decoder::DecoderLayer;
+use super::lora::LoraLinear;
 use super::rms_norm::RmsNorm;
 
 use burn::module::{Content, DisplaySettings, Module, ModuleDisplay};
-use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
+use burn::nn::{Embedding, EmbeddingConfig};
 use burn::tensor::{Int, Tensor, backend::Backend};
 
 /// Configuration describing the simplified Gemma-style transformer.
@@ -341,7 +342,7 @@ pub struct LlmModel<B: Backend> {
     /// The transformer body.
     pub model: Transformer<B>,
     /// Output projection to vocab logits. `None` when embeddings are tied.
-    pub lm_head: Option<Linear<B>>,
+    pub lm_head: Option<LoraLinear<B>>,
 }
 
 impl<B: Backend> LlmModel<B> {
@@ -352,13 +353,16 @@ impl<B: Backend> LlmModel<B> {
             None
         } else {
             Some(
-                LinearConfig::new(config.d_model, config.vocab_size)
-                    .with_bias(false)
-                    .with_initializer(burn::module::Initializer::Normal {
+                LoraLinear::init(
+                    config.d_model,
+                    config.vocab_size,
+                    false,
+                    burn::module::Initializer::Normal {
                         mean: 0.0,
                         std: 0.02,
-                    })
-                    .init(device),
+                    },
+                    device,
+                ),
             )
         };
         Self { model, lm_head }
@@ -375,10 +379,13 @@ impl<B: Backend> LlmModel<B> {
             None
         } else {
             Some(
-                LinearConfig::new(config.d_model, config.vocab_size)
-                    .with_bias(false)
-                    .with_initializer(burn::module::Initializer::Zeros)
-                    .init(device),
+                LoraLinear::init(
+                    config.d_model,
+                    config.vocab_size,
+                    false,
+                    burn::module::Initializer::Zeros,
+                    device,
+                ),
             )
         };
         Self { model, lm_head }
