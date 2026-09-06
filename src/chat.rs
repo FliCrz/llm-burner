@@ -1,4 +1,5 @@
-//! Interactive chat over the mmap'd GGUF engine (CPU-only quantized inference).
+//! Interactive chat over the mmap'd GGUF engine (Vulkan-accelerated compute
+//! on Vulkan-capable machines, CPU fallback otherwise).
 //!
 //! The prompt for each turn is rendered from the model's Jinja chat template
 //! (read from the sibling `tokenizer_config.json`), so chat-format-trained

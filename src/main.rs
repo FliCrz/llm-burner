@@ -257,11 +257,13 @@ enum Command {
         device: DeviceChoice,
     },
 
-    /// Chat with a quantized GGUF model (CPU-only inference).
+    /// Chat with a quantized GGUF model (Vulkan-accelerated compute on
+    /// Vulkan-capable machines, mmap CPU fallback otherwise).
     Chat {
-        /// Directory containing the exported `model.gguf`, `tokenizer.json`,
-        /// and `tokenizer_config.json` (use `--gguf`/`--tokenizer` to point at
-        /// specific files elsewhere).
+        /// Directory containing the exported `model.gguf`, with optional
+        /// `tokenizer.json`/`tokenizer_config.json` siblings; when they are
+        /// absent the tokenizer embedded in the GGUF is used (BPE models)
+        /// (use `--gguf`/`--tokenizer` to point at specific files elsewhere).
         #[arg(long, default_value = "artifacts/trained")]
         model_dir: PathBuf,
 
@@ -269,7 +271,8 @@ enum Command {
         #[arg(long)]
         gguf: Option<PathBuf>,
 
-        /// Explicit tokenizer file (defaults to `<model_dir>/tokenizer.json`).
+        /// Explicit tokenizer file (defaults to `<model_dir>/tokenizer.json`;
+        /// optional when the GGUF embeds GPT-2-style BPE tokenizer metadata).
         #[arg(long)]
         tokenizer: Option<PathBuf>,
 

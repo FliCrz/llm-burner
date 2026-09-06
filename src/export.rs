@@ -273,6 +273,35 @@ const TOKEN_TYPE_UNUSED: u32 = 5;
 
 /// Write GGUF `tokenizer.ggml.*` metadata from a tokenizer.
 ///
+/// This makes the GGUF self-contained for GPT-2-style BPE tokenizers, so
+/// `chat` can run with no sibling `tokenizer.json` at all.
+///
+/// # Reader-side plan
+///
+/// To load the tokenizer back out of a GGUF (so `tokenizer.json` becomes
+/// optional at inference time), reconstruct a `tokenizers::Tokenizer` from the
+/// metadata below:
+///
+/// - `tokenizer.ggml.model` — `"gpt2"` (byte-level BPE) or `"llama"`
+///   (SentencePiece/unigram). Only the BPE case is faithfully reconstructible
+///   from what we export: builds with
+///   `tokenizers::models::bpe::BpeBuilder::vocab_and_merges` from `.tokens` + `.merges`,
+///   plus the `ByteLevel` pre-tokenizer (with `byte_fallback: true` for the
+///   `qwen2`/gpt2 family); `.token_type` gives special ids, and
+///   `.pad_token_id`/`.eos_token_id` seed `TokenizerStore`.
+/// - `tokenizer.ggml.model == "llama"` — *not* readable back faithfully:
+///   SPM/unigram tokenizers need their real per-token scores in
+///   `tokenizer.ggml.scores`, which we currently write as `0.0` (see below).
+///   Until real scores are exported, these GGUFs must keep a sibling
+///   `tokenizer.json`; `chat` should error with that hint rather than guess.
+///
+/// To close that gap later, write the actual scores at export: `Unigram`
+/// scores are available from a loaded HF tokenizer
+/// (`tokenizers::models::ModelWrapper::Unigram(...).vocab`), mapped by id the
+/// same way `vocab_ordered()` maps tokens.
+///
+/// # llama.cpp compatibility
+///
 /// Two conventions must be honored for llama.cpp to load the file:
 ///
 /// - Vocabulary coverage: HF tokenizers often define fewer ids than
