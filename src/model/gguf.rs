@@ -268,6 +268,113 @@ fn row_bytes(dt: GgmlType, cols: usize) -> usize {
     }
 }
 
+/// Dequantize one packed row of a block-quant matrix into `out[cols]`.
+///
+/// Handles every legacy 32-element-block layout (`Q4_0`..`Q8_0`) and the
+/// 256-element `Q8K`. Callers must have already checked that `cols` is a
+/// whole number of native blocks and that `dt` is a supported block quant.
+fn dequant_row(dt: GgmlType, bytes: &[u8], row: usize, cols: usize, out: &mut [f32]) {
+    use GgmlType::*;
+    match dt {
+        F32 | F16 | BF16 => unreachable!("dequant_row called for float dtype"),
+        Q8_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 => {
+            let bsz = row_bytes(dt, 32);
+            let base = row * (cols / 32 * bsz);
+            for b in 0..cols / 32 {
+                let o = base + b * bsz;
+                let (d, m, qh, qs) = match dt {
+                    Q8_0 => (
+                        f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]])),
+                        0.0,
+                        0u32,
+                        &bytes[o + 2..o + 2 + 32],
+                    ),
+                    Q4_0 => (
+                        f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]])),
+                        0.0,
+                        0u32,
+                        &bytes[o + 2..o + 2 + 16],
+                    ),
+                    Q4_1 => (
+                        f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]])),
+                        f16_to_f32(u16::from_le_bytes([bytes[o + 2], bytes[o + 3]])),
+                        0u32,
+                        &bytes[o + 4..o + 4 + 16],
+                    ),
+                    Q5_0 => (
+                        f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]])),
+                        0.0,
+                        u32::from_le_bytes([bytes[o + 2], bytes[o + 3], bytes[o + 4], bytes[o + 5]]),
+                        &bytes[o + 6..o + 6 + 16],
+                    ),
+                    Q5_1 => (
+                        f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]])),
+                        f16_to_f32(u16::from_le_bytes([bytes[o + 2], bytes[o + 3]])),
+                        u32::from_le_bytes([bytes[o + 4], bytes[o + 5], bytes[o + 6], bytes[o + 7]]),
+                        &bytes[o + 8..o + 8 + 16],
+                    ),
+                    _ => unreachable!(),
+                };
+                let base = b * 32;
+                match dt {
+                    Q8_0 => {
+                        for j in 0..32 {
+                            out[base + j] = d * (qs[j] as i8) as f32;
+                        }
+                    }
+                    Q4_0 => {
+                        for j in 0..16 {
+                            let lo = (qs[j] & 0x0f) as i32 - 8;
+                            let hi = (qs[j] >> 4) as i32 - 8;
+                            out[base + j] = d * lo as f32;
+                            out[base + j + 16] = d * hi as f32;
+                        }
+                    }
+                    Q4_1 => {
+                        for j in 0..16 {
+                            let lo = (qs[j] & 0x0f) as i32;
+                            let hi = (qs[j] >> 4) as i32;
+                            out[base + j] = d * lo as f32 + m;
+                            out[base + j + 16] = d * hi as f32 + m;
+                        }
+                    }
+                    Q5_0 => {
+                        for j in 0..16 {
+                            let lo = ((qs[j] & 0x0f) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+                            let hi =
+                                ((qs[j] >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+                            out[base + j] = d * lo as f32;
+                            out[base + j + 16] = d * hi as f32;
+                        }
+                    }
+                    Q5_1 => {
+                        for j in 0..16 {
+                            let lo = (qs[j] & 0x0f) as u32 | (((qh >> j) & 1) << 4);
+                            let hi = (qs[j] >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4);
+                            out[base + j] = d * lo as f32 + m;
+                            out[base + j + 16] = d * hi as f32 + m;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Q8K => {
+            let bsz = row_bytes(Q8K, QK_K);
+            let base = row * (cols / QK_K * bsz);
+            for b in 0..cols / QK_K {
+                let o = base + b * bsz;
+                let d = f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+                let qs = &bytes[o + 4..o + 4 + QK_K];
+                for j in 0..QK_K {
+                    out[b * QK_K + j] = d * (qs[j] as i8) as f32;
+                }
+            }
+        }
+        _ => unreachable!("dequant_row called for unsupported dtype"),
+    }
+}
+
 /// Compute `out[r] = dot(row_r, x)` for every row of `m`.
 ///
 /// The Q4_K fast path quantizes the shared activation strip once and uses the
@@ -470,6 +577,17 @@ fn meta_str<'a>(meta: &'a HashMap<String, MetaValue>, key: &str) -> Option<&'a s
     meta.get(key).and_then(MetaValue::as_str)
 }
 
+fn meta_str_array(meta: &HashMap<String, MetaValue>, key: &str) -> Option<Vec<String>> {
+    match meta.get(key) {
+        Some(MetaValue::Array(v)) => Some(
+            v.iter()
+                .filter_map(|m| MetaValue::as_str(m).map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn meta_count(meta: &HashMap<String, MetaValue>, key: &str) -> Option<usize> {
     meta.get(key)
         .and_then(MetaValue::as_u64)
@@ -557,6 +675,48 @@ fn config_from_gguf(file: &GgufFile) -> Result<(LlmModelConfig, bool)> {
 }
 
 // ---------------------------------------------------------------------------
+// Embedded tokenizer
+// ---------------------------------------------------------------------------
+
+/// Tokenizer metadata embedded in a GGUF (`tokenizer.ggml.*`).
+///
+/// Only the GPT-2-style byte-level BPE layout (`model == "gpt2"`) can be
+/// faithfully rebuilt, from `.tokens` + `.merges`; the SentencePiece
+/// ("llama") layout needs its real per-token scores, which the exporter
+/// currently writes as `0.0`, so those files must keep a sibling
+/// `tokenizer.json`. See `crate::export::add_tokenizer_metadata`.
+pub enum EmbeddedTokenizer {
+    /// No `tokenizer.ggml.model` key; the file carries no tokenizer.
+    None,
+    /// Byte-level BPE, rebuilt from the embedded vocabulary and merges.
+    Bpe(TokenizerStore),
+    /// SentencePiece/unigram ("llama" family): sibling `tokenizer.json` required.
+    LlamaOnly,
+}
+
+fn embedded_tokenizer(file: &GgufFile) -> Result<EmbeddedTokenizer> {
+    let meta = &file.metadata;
+    let Some(model) = meta_str(meta, "tokenizer.ggml.model") else {
+        return Ok(EmbeddedTokenizer::None);
+    };
+    match model {
+        "gpt2" => {
+            let tokens = meta_str_array(meta, "tokenizer.ggml.tokens").unwrap_or_default();
+            let merges = meta_str_array(meta, "tokenizer.ggml.merges").unwrap_or_default();
+            let eos = meta_count(meta, "tokenizer.ggml.eos_token_id").unwrap_or(0) as u32;
+            let pad = meta_count(meta, "tokenizer.ggml.pad_token_id").unwrap_or(0) as u32;
+            let chat_template =
+                meta_str(meta, "tokenizer.chat_template").map(str::to_string);
+            Ok(EmbeddedTokenizer::Bpe(TokenizerStore::from_gguf(
+                &tokens, &merges, eos, pad, chat_template,
+            )?))
+        }
+        "llama" => Ok(EmbeddedTokenizer::LlamaOnly),
+        other => bail!("unsupported embedded tokenizer model `{other}`"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 
@@ -571,6 +731,9 @@ pub struct GgufEngine {
     output: Option<MatRef>,
     inv_freq: Vec<f32>,
     neox_rope: bool,
+    /// Tokenizer metadata embedded in the file (for chat without a sibling
+    /// `tokenizer.json`).
+    tokenizer: EmbeddedTokenizer,
 }
 
 /// TEMP-DEBUG: per-stage intermediates captured by `GgufEngine::debug_layer_trace`.
@@ -801,7 +964,13 @@ impl GgufEngine {
             output,
             inv_freq,
             neox_rope,
+            tokenizer: embedded_tokenizer(&file)?,
         })
+    }
+
+    /// The tokenizer embedded in the GGUF, if any.
+    pub fn embedded_tokenizer(&self) -> &EmbeddedTokenizer {
+        &self.tokenizer
     }
 
     /// The parsed model configuration.
@@ -1052,31 +1221,39 @@ impl GgufEngine {
                 );
                 out[b * QK_K..(b + 1) * QK_K].copy_from_slice(&scratch);
             }
-        } else {
-            let rlen = row_bytes(dt, cols);
-            let base = row * rlen;
-            for (j, o) in out.iter_mut().enumerate() {
-                *o = match dt {
-                    GgmlType::F32 => f32::from_le_bytes(
-                        bytes[base + j * 4..base + j * 4 + 4].try_into().unwrap(),
-                    ),
-                    GgmlType::F16 => f16_to_f32(u16::from_le_bytes([
-                        bytes[base + j * 2],
-                        bytes[base + j * 2 + 1],
-                    ])),
-                    GgmlType::BF16 => bf16_to_f32(u16::from_le_bytes([
-                        bytes[base + j * 2],
-                        bytes[base + j * 2 + 1],
-                    ])),
-                    _ => {
-                        bail!(
-                            "token_embd row must be F32/F16/BF16 or K-quant aligned; \
-                             got {:?} with unaligned width {cols}",
-                            dt
-                        )
-                    }
-                };
-            }
+            return Ok(());
+        }
+        let legacy32 = matches!(dt, GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0);
+        if legacy32 && cols.is_multiple_of(32) {
+            dequant_row(dt, bytes, row, cols, out);
+            return Ok(());
+        }
+        if dt == GgmlType::Q8K && cols_q4k_aligned(cols) {
+            dequant_row(dt, bytes, row, cols, out);
+            return Ok(());
+        }
+        let base = row * row_bytes(dt, cols);
+        for (j, o) in out.iter_mut().enumerate() {
+            *o = match dt {
+                GgmlType::F32 => f32::from_le_bytes(
+                    bytes[base + j * 4..base + j * 4 + 4].try_into().unwrap(),
+                ),
+                GgmlType::F16 => f16_to_f32(u16::from_le_bytes([
+                    bytes[base + j * 2],
+                    bytes[base + j * 2 + 1],
+                ])),
+                GgmlType::BF16 => bf16_to_f32(u16::from_le_bytes([
+                    bytes[base + j * 2],
+                    bytes[base + j * 2 + 1],
+                ])),
+                _ => {
+                    bail!(
+                        "token_embd row must be F32/F16/BF16 or block-quant aligned; \
+                         got {:?} with unaligned width {cols}",
+                        dt
+                    )
+                }
+            };
         }
         Ok(())
     }
@@ -1339,6 +1516,187 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(i, _)| i as u32)
             .unwrap()
+    }
+
+    /// A tiny GPT-2-style byte-level BPE store so `embed`/tokenizer tests do
+    /// not depend on a real tokenizer on disk.
+    fn bpe_store_for_gguf() -> TokenizerStore {
+        let keep: Vec<u8> = (33u8..=126).chain(161u8..=172).chain(174u8..=255).collect();
+        let mut vocab: ahash::AHashMap<String, u32> = (0..=255u8)
+            .map(|b| {
+                let t = if keep.contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    char::from_u32(b as u32 + 256).unwrap().to_string()
+                };
+                (t, b as u32)
+            })
+            .collect();
+        for (t, id) in [
+            ("<|endoftext|>", 256u32),
+            ("hello", 257u32),
+            ("he", 258u32),
+            ("hel", 259u32),
+            ("hell", 260u32),
+        ] {
+            vocab.insert(t.to_string(), id);
+        }
+        let merges: Vec<String> = [
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+            ("hel".to_string(), "l".to_string()),
+            ("hell".to_string(), "o".to_string()),
+        ]
+        .iter()
+        .map(|(a, b)| format!("{a} {b}"))
+        .collect();
+
+        let store = TokenizerStore::from_gguf(
+            &{
+                let mut positional = vec![String::new(); vocab.len()];
+                for (t, id) in &vocab {
+                    positional[*id as usize] = t.clone();
+                }
+                positional
+            },
+            &merges,
+            256,
+            256,
+            Some("{{ messages }}".to_string()),
+        )
+        .unwrap();
+        store
+    }
+
+    /// The full chat path: a real `GgufWriter` file carrying
+    /// `tokenizer.ggml.*` (`add_tokenizer_metadata`) is read back by
+    /// `embedded_tokenizer` and must encode identically to the source.
+    #[test]
+    fn embedded_tokenizer_roundtrips_through_gguf() {
+        use crate::export::add_tokenizer_metadata;
+        use rlx_gguf::{GgufWriter, MetaValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = bpe_store_for_gguf();
+
+        let path = dir.path().join("bpe.gguf");
+        let mut writer = GgufWriter::new();
+        writer.set_arch("qwen2");
+        add_tokenizer_metadata(&mut writer, &store, 256 + 32, Some("qwen2"));
+        writer.write_to_path(&path).unwrap();
+
+        let file = GgufFile::from_path(&path).unwrap();
+        let embedded = embedded_tokenizer(&file).unwrap();
+        assert!(matches!(&embedded, EmbeddedTokenizer::Bpe(_)));
+        let EmbeddedTokenizer::Bpe(ref rebuilt) = embedded else { unreachable!() };
+        for text in ["hello", "hello hello", "café"] {
+            assert_eq!(
+                store.encode_raw(text).unwrap(),
+                rebuilt.encode_raw(text).unwrap(),
+                "encode mismatch for {text:?}"
+            );
+        }
+        assert_eq!(rebuilt.eos_id, store.eos_id);
+        assert_eq!(rebuilt.chat_template, store.chat_template);
+
+        // SentencePiece family must refuse to rebuild (needs a sibling file).
+        let llama_path = dir.path().join("llama.gguf");
+        let mut w = GgufWriter::new();
+        w.set_arch("llama");
+        w.set_meta("tokenizer.ggml.model", MetaValue::String("llama".into()));
+        w.write_to_path(&llama_path).unwrap();
+        let f = GgufFile::from_path(&llama_path).unwrap();
+        assert!(matches!(
+            embedded_tokenizer(&f).unwrap(),
+            EmbeddedTokenizer::LlamaOnly
+        ));
+
+        // Absent metadata means `None`, not an error.
+        let none_path = dir.path().join("none.gguf");
+        let mut w = GgufWriter::new();
+        w.set_arch("qwen2");
+        w.write_to_path(&none_path).unwrap();
+        let f = GgufFile::from_path(&none_path).unwrap();
+        assert!(matches!(
+            embedded_tokenizer(&f).unwrap(),
+            EmbeddedTokenizer::None
+        ));
+    }
+
+    /// `dequant_row` must bit-match rlx_gguf's own reference dequant for every
+    /// legacy 32-element block layout the engine advertises, at widths that are
+    /// block-aligned but *not* QK_K-aligned — the exact case that used to abort
+    /// `embed_row` with "got Q8_0 with unaligned width".
+    #[test]
+    fn dequant_row_matches_reference_for_legacy_quants() {
+        use rlx_gguf::{
+            dequant_q4_0, dequant_q4_1, dequant_q5_0, dequant_q5_1, dequant_q8_0,
+        };
+        use rlx_gguf::quantize::{
+            quantize_q4_0, quantize_q4_1, quantize_q5_0, quantize_q5_1, quantize_q8_0,
+        };
+
+        // 3 × 32 blocks: 96 is aligned for legacy quants but NOT QK_K (256).
+        let cols = 96;
+        let mut src = vec![0.0f32; cols];
+        for j in 0..cols {
+            // Wide dynamic range to stress per-block scales.
+            src[j] = ((j * 37) % 251) as f32 / 64.0 - 1.25;
+        }
+
+        let cases = [
+            (GgmlType::Q8_0, quantize_q8_0(&src).unwrap()),
+            (GgmlType::Q4_0, quantize_q4_0(&src).unwrap()),
+            (GgmlType::Q4_1, quantize_q4_1(&src).unwrap()),
+            (GgmlType::Q5_0, quantize_q5_0(&src).unwrap()),
+            (GgmlType::Q5_1, quantize_q5_1(&src).unwrap()),
+        ];
+        for (dt, packed) in cases {
+            let mut out = vec![0.0f32; cols];
+            dequant_row(dt, &packed, 0, cols, &mut out);
+            let expect = match dt {
+                GgmlType::Q8_0 => dequant_q8_0(&packed, cols).unwrap(),
+                GgmlType::Q4_0 => dequant_q4_0(&packed, cols).unwrap(),
+                GgmlType::Q4_1 => dequant_q4_1(&packed, cols).unwrap(),
+                GgmlType::Q5_0 => dequant_q5_0(&packed, cols).unwrap(),
+                GgmlType::Q5_1 => dequant_q5_1(&packed, cols).unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(out, expect, "{dt:?} row 0");
+        }
+
+        // Row-offset indexing: a second packed row must be read at `row = 1`.
+        let mut two = Vec::new();
+        for _ in 0..2 {
+            two.extend(quantize_q8_0(&src).unwrap());
+        }
+        let row1 = &two[two.len() / 2..];
+        let mut out = vec![0.0f32; cols];
+        dequant_row(GgmlType::Q8_0, &two, 1, cols, &mut out);
+        assert_eq!(out, dequant_q8_0(row1, cols).unwrap(), "Q8_0 row 1");
+    }
+
+    /// `dequant_row` for the 256-element `Q8K` layout also matches the crate's
+    /// reference decoder.
+    #[test]
+    fn dequant_row_q8k_matches_reference() {
+        use rlx_gguf::{dequant_q8_k, quantize::quantize_q8_k_block};
+        let cols = QK_K * 2;
+        let mut src = vec![0.0f32; cols];
+        for j in 0..cols {
+            src[j] = ((j * 13) % 4096) as f32 / 32.0 - 32.0;
+        }
+        let mut packed = vec![0u8; cols / QK_K * Q8K_BLOCK_BYTES];
+        for b in 0..cols / QK_K {
+            quantize_q8_k_block(
+                &src[b * QK_K..(b + 1) * QK_K],
+                &mut packed
+                    [b * Q8K_BLOCK_BYTES..(b + 1) * Q8K_BLOCK_BYTES],
+            );
+        }
+        let mut out = vec![0.0f32; cols];
+        dequant_row(GgmlType::Q8K, &packed, 0, cols, &mut out);
+        assert_eq!(out, dequant_q8_k(&packed, cols).unwrap());
     }
 
     /// Rebuild a burn model whose weights are exactly the *dequantized* GGUF

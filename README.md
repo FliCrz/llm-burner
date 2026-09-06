@@ -132,23 +132,28 @@ cargo run --release -- train \
   --steps 100
 ```
 
-### 3. Chat with a Quantized Checkpoint (CPU)
+### 3. Chat with a Quantized Checkpoint
 
-The exported `model.gguf` runs on plain Rust + SIMD — no GPU, no Burn tensors —
-via an mmap-backed engine. Start an interactive REPL against `artifacts/trained/`
-(the directory holding `model.gguf`, `tokenizer.json`, and `tokenizer_config.json`):
+The exported `model.gguf` runs via an mmap-backed engine with a raw-Vulkan
+compute backend on Vulkan-capable machines (integrated GPUs prefer unified
+memory) and a plain Rust + SIMD CPU fallback — no Burn tensors. Start an
+interactive REPL against `artifacts/trained/` (the directory holding
+`model.gguf`; `tokenizer.json`/`tokenizer_config.json` are optional for
+GPT-2-style BPE models, whose tokenizer is already embedded in the GGUF as
+`tokenizer.ggml.*` metadata):
 
 ```bash
-cargo run --release -- chat
+cargo run --release -- chat --model ./artifacts/trained/model.gguf
 ```
 
 The prompt for each turn is rendered from the model's Jinja chat template
-(`tokenizer_config.json`), responses stream token-by-token, and history is kept
+(read from `tokenizer_config.json` when present, otherwise embedded in the
+GGUF), responses stream token-by-token, and history is kept
 for the session. Extra flags:
 
 ```bash
 cargo run --release -- chat \
-  --model-dir ./artifacts/trained \
+  --model ./artifacts/trained/model.gguf \
   --temperature 0.8 --top-p 0.9 --max-tokens 512 \
   --prompt "What is llm-burner?"   # one-shot answer, then exit
 ```

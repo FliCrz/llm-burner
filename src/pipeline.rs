@@ -86,13 +86,7 @@ where
     }
     let tokenizer = TokenizerStore::from_file(&tokenizer_path)?;
 
-    let shards = classify_download(model_dir)?.safetensors;
-    if shards.is_empty() {
-        bail!(
-            "no `.safetensors` weights found in `{}`",
-            model_dir.display()
-        );
-    }
+    let shards = crate::hf::base_shards(&classify_download(model_dir)?)?;
     let shards_refs: Vec<&Path> = shards.iter().map(PathBuf::as_path).collect();
 
     let mut model = LlmModel::<B>::new(&config, &Default::default());
@@ -233,13 +227,15 @@ impl TrainingMemory {
 }
 
 /// Estimate the peak memory of a fine-tune: weights + gradients + AdamW state
-/// (4x the parameter bytes) plus a heuristic activation bound — roughly 16
+/// (4x the parameter bytes when training everything; only the trainable
+/// subset when LoRA is active) plus a heuristic activation bound — roughly 16
 /// hidden-sized and 8 intermediate-sized tensors per decoder layer (forward
 /// values kept alive for backward), plus ~3 vocabulary-sized logits/softmax
 /// buffers. Deliberately conservative: better to refuse an oversized run than
 /// to let it die mid-autotune inside wgpu.
 fn estimate_training_memory(
     params: u64,
+    trainable: u64,
     elem_size: usize,
     batch_size: usize,
     seq_len: usize,
@@ -252,8 +248,8 @@ fn estimate_training_memory(
     let logits = 3 * config.vocab_size.max(1) as u64;
     TrainingMemory {
         weights: p * elem,
-        gradients: p * elem,
-        optimizer: 2 * p * elem,
+        gradients: trainable * elem,
+        optimizer: 2 * trainable * elem,
         activations: tokens.saturating_mul(elem).saturating_mul(
             per_layer
                 .saturating_mul(config.n_layers as u64)
@@ -351,9 +347,17 @@ fn check_memory_against(
         return Ok(());
     };
     let config = LlmModelConfig::from_transformers(&transformers);
-    let params = config.param_count();
+    let base = config.param_count();
+    // With LoRA the base weights are frozen, so gradients and AdamW state cover
+    // only the adapters (which add `base` to the resident-weights total).
+    let adapters = train
+        .lora
+        .as_ref()
+        .map_or(0, |lora| crate::qlora::adapter_params(&config, lora));
+    let params = base + adapters;
+    let trainable = if adapters > 0 { adapters } else { params };
     let estimate = |elem: usize| {
-        estimate_training_memory(params, elem, train.batch_size, train.seq_len, &config)
+        estimate_training_memory(params, trainable, elem, train.batch_size, train.seq_len, &config)
     };
     let est = estimate(compute_elem);
     let compute_label = if compute_elem == train.precision.elem_size() {
@@ -364,13 +368,18 @@ fn check_memory_against(
 
     log::info!(
         "memory pre-flight: need {} at {compute_label} (weights {} + gradients \
-         {} + AdamW {} + activations {}; {} parameters), {} available",
+         {} + AdamW {} + activations {}; {} parameters{}), {} available",
         gib(est.total()),
         gib(est.weights),
         gib(est.gradients),
         gib(est.optimizer),
         gib(est.activations),
         params,
+        if adapters > 0 {
+            format!(", {adapters} trainable via LoRA")
+        } else {
+            String::new()
+        },
         gib(available),
     );
 
@@ -485,17 +494,57 @@ where
         apply_ablation(&mut model, &tokenizer, cfg, config.max_seq_len)?;
     }
 
-    log::info!("tokenizing corpus in `{}`", inputs.dataset_dir.display());
-    let files = collect_text_files(&inputs.dataset_dir, &["txt", "text", "md", "jsonl"]);
-    if files.is_empty() {
-        bail!(
-            "no text files (.txt/.text/.md/.jsonl) found in `{}`",
-            inputs.dataset_dir.display()
+    // QLoRA-style fine-tune: inject rank-`r` adapters on every projection and
+    // freeze the base weights so gradients and optimizer state touch only the
+    // adapters. (`freeze_base` also keeps embeddings/norms frozen.)
+    if let Some(lora) = inputs.train.lora.clone() {
+        let device = model.model.embed_tokens.weight.val().device();
+        log::info!(
+            "injecting LoRA adapters (r={}, alpha={}, dropout={})",
+            lora.rank,
+            lora.alpha,
+            lora.dropout
+        );
+        crate::qlora::inject_lora(&mut model, &lora, &device);
+        model = crate::qlora::freeze_base(model);
+        let trainable = crate::qlora::trainable_elements(&model);
+        let total = config.param_count() + crate::qlora::adapter_params(&config, &lora);
+        log::info!(
+            "base weights frozen; fine-tuning {} of {} parameters via LoRA ({:.2}%)",
+            trainable,
+            total,
+            100.0 * trainable as f64 / total.max(1) as f64
         );
     }
-    // Streaming: one file resident at a time; windows land in one flat arena.
-    let (windows, total_tokens) =
-        tokenize_corpus(&tokenizer, &files, inputs.train.seq_len, tokenizer.pad_id)?;
+
+    log::info!("tokenizing corpus in `{}`", inputs.dataset_dir.display());
+    // QA/DPO datasets (`.json`/`.jsonl` records with question/answer pairs)
+    // take precedence: each pair is rendered with the model's chat template and
+    // becomes its own training window. Otherwise the plain-text path streams
+    // `.txt`/`.text`/`.md`/`.jsonl` files into one flat token arena.
+    let qa_records = crate::data::load_qa_corpus(&inputs.dataset_dir)?;
+    let (windows, total_tokens) = if !qa_records.is_empty() {
+        log::info!(
+            "QA corpus: {} question/answer pairs",
+            qa_records.len()
+        );
+        crate::data::tokenize_qa_texts(
+            &tokenizer,
+            &qa_records,
+            tokenizer.chat_template.as_deref(),
+            inputs.train.seq_len,
+            tokenizer.pad_id,
+        )?
+    } else {
+        let files = collect_text_files(&inputs.dataset_dir, &["txt", "text", "md", "jsonl"]);
+        if files.is_empty() {
+            bail!(
+                "no text (.txt/.text/.md/.jsonl) or QA/DPO (.json) data found in `{}`",
+                inputs.dataset_dir.display()
+            );
+        }
+        tokenize_corpus(&tokenizer, &files, inputs.train.seq_len, tokenizer.pad_id)?
+    };
     if windows.len() < inputs.train.batch_size {
         bail!(
             "corpus produced {} windows ({} tokens), but `batch-size` is {}; shorten `--seq-len` or add more text",
@@ -538,6 +587,22 @@ where
     std::fs::create_dir_all(&checkpoint_dir)
         .with_context(|| format!("failed to create `{}`", checkpoint_dir.display()))?;
     copy_export_inputs(&inputs.model_dir, &checkpoint_dir)?;
+
+    let mut trained = trained;
+    if let Some(lora) = inputs.train.lora.clone() {
+        // A PEFT-compatible adapter ships alongside the merged checkpoint, so
+        // the same run is usable raw on the base model or self-contained.
+        crate::qlora::export_adapter(
+            &trained,
+            &checkpoint_dir,
+            load_dtype,
+            &lora,
+            &inputs.model_dir.display().to_string(),
+        )?;
+        let merged = crate::qlora::merge_lora(&mut trained);
+        log::info!("folded LoRA into {merged} projections");
+    }
+
     let safetensors_path = checkpoint_dir.join("model.safetensors");
     export_safetensors(&trained, &safetensors_path, inputs.train.precision)?;
 
@@ -596,7 +661,8 @@ mod tests {
         let transformers = TransformersConfig::from_path(dir.path().join("config.json")).unwrap();
         let config = LlmModelConfig::from_transformers(&transformers);
         let params = config.param_count();
-        let total = |elem: usize| estimate_training_memory(params, elem, 1, 16, &config).total();
+        let total =
+            |elem: usize| estimate_training_memory(params, params, elem, 1, 16, &config).total();
         let bf16_total = total(2);
         let f32_total = total(4);
         assert!(f32_total > bf16_total);

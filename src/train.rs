@@ -141,6 +141,12 @@ pub struct TrainConfig {
     pub log_every: usize,
     /// Floating-point dtype for weights, training math, and safetensors export.
     pub precision: Precision,
+    /// LoRA fine-tuning settings. When set, rank-`r` adapters are injected on
+    /// every attention/MLP projection and the base weights stay frozen; the
+    /// trained adapters are exported both standalone (PEFT `adapter_*`) and
+    /// merged into the ordinary checkpoint. `None` does a conventional
+    /// full-parameter fine-tune.
+    pub lora: Option<crate::qlora::LoraTrainConfig>,
     /// Show the Ratatui progress dashboard while training. When disabled
     /// (`--no-tui`), progress is reported through the log file only — useful
     /// for tests and non-interactive runs.
@@ -164,6 +170,7 @@ impl Default for TrainConfig {
             weight_decay: 0.1,
             log_every: 10,
             precision: Precision::default(),
+            lora: None,
             tui: true,
             output_redirect: None,
             run_info: Default::default(),
@@ -329,9 +336,76 @@ mod tests {
             tui: false,
             output_redirect: None,
             run_info: Default::default(),
+            lora: None,
         };
 
         let device = Default::default();
+        let init_batch = build_batch::<InferBackend>(windows.window_tokens(0, 2), 8, 0, &device);
+        let init_loss: f32 = model
+            .valid()
+            .forward_classification(init_batch)
+            .loss
+            .into_scalar();
+
+        let trained = train_model(model, &windows, 0, &cfg);
+
+        let final_batch = build_batch::<InferBackend>(windows.window_tokens(0, 2), 8, 0, &device);
+        let final_loss: f32 = trained
+            .forward_classification(final_batch)
+            .loss
+            .into_scalar();
+
+        assert!(
+            final_loss < init_loss,
+            "expected final_loss ({final_loss}) < init_loss ({init_loss})"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "gpu"))] // trains on the compiled TrainBackend (GPU under `gpu`)
+    fn train_model_reduces_loss_with_lora_on_toy_sequence() {
+        let config = LlmModelConfig::tiny();
+        let device = Default::default();
+        let mut model = train_model_from_config::<TrainBackend>(&config);
+        crate::qlora::inject_lora(
+            &mut model,
+            &crate::qlora::LoraTrainConfig {
+                rank: 4,
+                alpha: 8.0,
+                dropout: 0.0,
+            },
+            &device,
+        );
+        let model = crate::qlora::freeze_base(model);
+
+        // The base weights must be frozen while the adapters stay trainable.
+        let proj = &model.model.layers[0].self_attn.q_proj;
+        assert!(!proj.weight.val().is_require_grad());
+        assert!(proj.lora_A.as_ref().unwrap().val().is_require_grad());
+
+        let sequence: Vec<u32> = (0..16).cycle().take(64).collect();
+
+        let mut windows = crate::data::WindowStore::new(8);
+        let chunked: Vec<Vec<u32>> = sequence.chunks(8).map(|c| c.to_vec()).collect();
+        for chunk in &chunked[..chunked.len() - 1] {
+            windows.extend_windows(chunk);
+        }
+        windows.push_padded_tail(chunked.last().unwrap(), 0);
+
+        let cfg = TrainConfig {
+            steps: 20,
+            batch_size: 2,
+            seq_len: 8,
+            lr: 1e-3,
+            weight_decay: 0.0,
+            log_every: 0,
+            precision: Precision::F32,
+            tui: false,
+            output_redirect: None,
+            run_info: Default::default(),
+            lora: None,
+        };
+
         let init_batch = build_batch::<InferBackend>(windows.window_tokens(0, 2), 8, 0, &device);
         let init_loss: f32 = model
             .valid()

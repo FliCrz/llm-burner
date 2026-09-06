@@ -1,5 +1,6 @@
+use super::lora::LoraLinear;
+
 use burn::module::{Initializer, Module};
-use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::{gelu_approximate, silu};
 use burn::tensor::{Tensor, backend::Backend};
 
@@ -10,11 +11,11 @@ use burn::tensor::{Tensor, backend::Backend};
 #[derive(Module, Debug)]
 pub struct Mlp<B: Backend> {
     /// Gating projection, `hidden -> intermediate`.
-    pub gate_proj: Linear<B>,
+    pub gate_proj: LoraLinear<B>,
     /// Up projection, `hidden -> intermediate`.
-    pub up_proj: Linear<B>,
+    pub up_proj: LoraLinear<B>,
     /// Down projection, `intermediate -> hidden`.
-    pub down_proj: Linear<B>,
+    pub down_proj: LoraLinear<B>,
     /// `true` -> GELU gate (Gemma), `false` -> SiLU gate (SwiGLU, Llama/Qwen).
     pub use_gelu: bool,
 }
@@ -48,18 +49,27 @@ impl<B: Backend> Mlp<B> {
         initializer: Initializer,
         device: &B::Device,
     ) -> Self {
-        let gate_proj = LinearConfig::new(hidden_size, intermediate_size)
-            .with_bias(false)
-            .with_initializer(initializer.clone())
-            .init(device);
-        let up_proj = LinearConfig::new(hidden_size, intermediate_size)
-            .with_bias(false)
-            .with_initializer(initializer.clone())
-            .init(device);
-        let down_proj = LinearConfig::new(intermediate_size, hidden_size)
-            .with_bias(false)
-            .with_initializer(initializer)
-            .init(device);
+        let gate_proj = LoraLinear::init(
+            hidden_size,
+            intermediate_size,
+            false,
+            initializer.clone(),
+            device,
+        );
+        let up_proj = LoraLinear::init(
+            hidden_size,
+            intermediate_size,
+            false,
+            initializer.clone(),
+            device,
+        );
+        let down_proj = LoraLinear::init(
+            intermediate_size,
+            hidden_size,
+            false,
+            initializer,
+            device,
+        );
 
         Self {
             gate_proj,
